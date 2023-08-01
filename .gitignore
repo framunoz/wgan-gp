@@ -1,0 +1,6 @@
+/.vscode
+/dataset
+/dcgan_log_dir
+/logs
+/mnist_log_dir
+/runs
