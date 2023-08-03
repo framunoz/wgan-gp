@@ -3,7 +3,6 @@ from pathlib import Path
 from typing import Literal
 
 import dataloader
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -12,13 +11,44 @@ import torchvision
 import torchvision.datasets as datasets
 import torchvision.models as models
 import torchvision.transforms as transforms
-from model import Discriminator, Encoder, Generator
+from model import Critic, Encoder, Generator
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import save_image
 from tqdm import tqdm
 from utils import alexnet_norm, denorm, gradient_penalty
+
+
+def get_device(device=None) -> torch.device:
+    """Gets the device, or set a device if None is provided. Always prefer cuda."""
+    # Define device
+    if device is None:  # Default
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(device)
+    return device
+
+
+def get_dataset(file_path: str, transform):
+    dataset = None
+
+    if file_path == "mnist":
+        dataset = datasets.MNIST(root="dataset/", transform=transform, download=True)
+    elif file_path == "celeba":
+        dataset = datasets.ImageFolder(root="celeb_dataset", transform=transform)
+
+    file_path = Path(file_path)
+    if dataset is not None:
+        pass
+    elif file_path.suffix == ".npy":
+        dataset = dataloader.NpyDataset(root=file_path, transform=transform)
+    elif file_path.suffix == ".h5py":
+        dataset = dataloader.H5Loader(file_path, transform=transform)
+    else:
+        raise FileNotFoundError("El archivo buscado no fue encontrado.")
+
+    return dataset
 
 
 # Training methods
@@ -36,19 +66,16 @@ def train_gan(
     weight_decay=1e-5,
     milestones=[25, 50, 75],
     device=None,
+    transform=None,
     file_path: str | Literal["mnist", "celeba"] = "shoes_images/shoes.hdf5",
     save_dir="networks/",
     summary_writer_dir="logs",
     verbose=True,
 ):
-    # Define device
-    if device is None:  # Default
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(device)
+    device = get_device(device)
 
     # Transforms
-    transform = transforms.Compose(
+    transform = transform or transforms.Compose(
         [
             transforms.Resize(image_size),
             transforms.ToTensor(),
@@ -59,12 +86,7 @@ def train_gan(
     )
 
     # Dataset and Dataloader
-    if file_path == "mnist":
-        dataset = datasets.MNIST(root="dataset/", transform=transform, download=True)
-    elif file_path == "celeba":
-        dataset = datasets.ImageFolder(root="celeb_dataset", transform=transform)
-    else:
-        dataset = dataloader.H5Loader(file_path)
+    dataset = get_dataset(file_path=file_path, transform=transform)
 
     data_loader = DataLoader(
         dataset,
@@ -74,7 +96,7 @@ def train_gan(
 
     # Models
     G = Generator(latent_dim, channels_img, num_filters).to(device)
-    D = Discriminator(channels_img, num_filters[::-1]).to(device)
+    C = Critic(channels_img, num_filters[::-1]).to(device)
 
     # Optimizers
     G_optimizer = optim.Adam(
@@ -83,16 +105,17 @@ def train_gan(
         betas=betas,
         weight_decay=weight_decay,
     )
-    D_optimizer = optim.Adam(
-        D.parameters(),
+    C_optimizer = optim.Adam(
+        C.parameters(),
         lr=learning_rate,
         betas=betas,
         weight_decay=weight_decay,
     )
 
     # for tensorboard plotting
-    fixed_noise = torch.randn(32, latent_dim, 1, 1).to(device)
+    fixed_noise = 2 * torch.rand(32, latent_dim, 1, 1).to(device) - 1
     summary_writer_dir = Path(summary_writer_dir)
+    summary_writer_dir.mkdir(exist_ok=True, parents=True)
     writer_real = SummaryWriter(summary_writer_dir / "real")
     writer_fake = SummaryWriter(summary_writer_dir / "fake")
     writer_loss = SummaryWriter(summary_writer_dir / "loss")
@@ -102,15 +125,15 @@ def train_gan(
     G_scheduler = optim.lr_scheduler.MultiStepLR(
         G_optimizer, milestones=milestones, gamma=0.75
     )
-    D_scheduler = optim.lr_scheduler.MultiStepLR(
-        D_optimizer, milestones=milestones, gamma=0.75
+    C_scheduler = optim.lr_scheduler.MultiStepLR(
+        C_optimizer, milestones=milestones, gamma=0.75
     )
 
-    D.train()
+    C.train()
     G.train()
 
     for epoch in range(num_epochs):
-        D_epoch_losses = []
+        C_epoch_losses = []
         G_epoch_losses = []
 
         if verbose:
@@ -127,28 +150,28 @@ def train_gan(
             # Train Critic: max E[critic(real)] - E[critic(fake)]
             # equivalent to minimizing the negative of that
             for _ in range(disc_iterations):
-                noise = torch.randn(cur_batch_size, latent_dim, 1, 1).to(device)
+                noise = 2 * torch.rand(cur_batch_size, latent_dim, 1, 1).to(device) - 1
                 fake = G(noise)
-                critic_real = D(real).reshape(-1)
-                critic_fake = D(fake).reshape(-1)
-                gp = gradient_penalty(D, real, fake, device=device)
-                D_loss = (
+                critic_real = C(real).reshape(-1)
+                critic_fake = C(fake).reshape(-1)
+                gp = gradient_penalty(C, real, fake, device=device)
+                C_loss = (
                     -(torch.mean(critic_real) - torch.mean(critic_fake))
                     + lambda_gp * gp
                 )
-                D.zero_grad()
-                D_loss.backward(retain_graph=True)
-                D_optimizer.step()
+                C.zero_grad()
+                C_loss.backward(retain_graph=True)
+                C_optimizer.step()
 
             # Train Generator: max E[critic(gen_fake)] <-> min -E[critic(gen_fake)]
-            gen_fake = D(fake).reshape(-1)
+            gen_fake = C(fake).reshape(-1)
             G_loss = -torch.mean(gen_fake)
             G.zero_grad()
             G_loss.backward()
             G_optimizer.step()
 
             # loss values
-            D_epoch_losses.append(D_loss.data.item())
+            C_epoch_losses.append(C_loss.data.item())
             G_epoch_losses.append(G_loss.data.item())
 
             # Print losses occasionally and print to tensorboard
@@ -163,29 +186,28 @@ def train_gan(
                         fake[:32], normalize=True
                     )
 
-                    loss_D_name, loss_G_name = "Loss Discriminator", "Loss Generator"
+                    loss_C_name, loss_G_name = "Loss Discriminator", "Loss Generator"
                     writer_real.add_image("Real", img_grid_real, global_step=step)
                     writer_fake.add_image("Fake", img_grid_fake, global_step=step)
-                    writer_loss.add_scalar(loss_D_name, D_loss, global_step=step)
+                    writer_loss.add_scalar(loss_C_name, C_loss, global_step=step)
                     writer_loss.add_scalar(loss_G_name, G_loss, global_step=step)
 
                 step += 1
 
-        D_avg_loss = torch.mean(torch.FloatTensor(D_epoch_losses)).item()
+        C_avg_loss = torch.mean(torch.FloatTensor(C_epoch_losses)).item()
         G_avg_loss = torch.mean(torch.FloatTensor(G_epoch_losses)).item()
-        writer_loss.add_scalar("Average loss Discriminator", D_avg_loss, epoch)
+        writer_loss.add_scalar("Average loss Discriminator", C_avg_loss, epoch)
         writer_loss.add_scalar("Average loss Generator", G_avg_loss, epoch)
 
         # Save models
         save_dir = Path(save_dir)
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir)
+        save_dir.mkdir(exist_ok=True, parents=True)
         torch.save(G.state_dict(), save_dir / "generator")
-        torch.save(D.state_dict(), save_dir / "discriminator")
+        torch.save(C.state_dict(), save_dir / "discriminator")
 
         # Decrease learning-rate
         G_scheduler.step()
-        D_scheduler.step()
+        C_scheduler.step()
 
 
 def train_encoder_with_noise(
@@ -198,19 +220,16 @@ def train_encoder_with_noise(
     num_epochs=100,
     betas=(0.5, 0.999),
     device=None,
+    transform=None,
     file_path="shoes_images/shoes.hdf5",
     save_dir="networks/",
     summary_writer_dir="logs",
     verbose=True,
 ):
-    # Define device
-    if device is None:  # Default
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(device)
+    device = get_device(device)
 
     # Transforms
-    transform = transforms.Compose(
+    transform = transform or transforms.Compose(
         [
             transforms.Resize(image_size),
             transforms.ToTensor(),
@@ -221,12 +240,7 @@ def train_encoder_with_noise(
     )
 
     # Dataset and Dataloader
-    if file_path == "mnist":
-        dataset = datasets.MNIST(root="dataset/", transform=transform, download=True)
-    elif file_path == "celeba":
-        dataset = datasets.ImageFolder(root="celeb_dataset", transform=transforms)
-    else:
-        dataset = dataloader.H5Loader(file_path)
+    dataset = get_dataset(file_path=file_path, transform=transform)
 
     data_loader = DataLoader(
         dataset,
@@ -258,6 +272,7 @@ def train_encoder_with_noise(
 
     # for tensorboard plotting
     summary_writer_dir = Path(summary_writer_dir)
+    summary_writer_dir.mkdir(exist_ok=True, parents=True)
     writer_real = SummaryWriter(summary_writer_dir / "real_encoder")
     writer_fake = SummaryWriter(summary_writer_dir / "fake_encoder")
     writer_loss = SummaryWriter(summary_writer_dir / "loss_encoder")
@@ -278,7 +293,7 @@ def train_encoder_with_noise(
         # minibatch training
         for batch_idx, (real, _) in iterable:
             # generate_noise
-            z = torch.randn(real.shape[0], latent_dim, 1, 1).to(device)
+            z = 2 * torch.rand(real.shape[0], latent_dim, 1, 1).to(device) - 1
             fake = G(z)
 
             # Train Encoder
@@ -331,19 +346,16 @@ def finetune_encoder_with_samples(
     betas=(0.5, 0.999),
     alpha=2e-3,
     device=None,
+    transform=None,
     file_path="shoes_images/shoes.hdf5",
     save_dir="networks/",
     summary_writer_dir="logs",
     verbose=True,
 ):
-    # Define device
-    if device is None:  # Default
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(device)
+    device = get_device(device)
 
     # Transforms
-    transform = transforms.Compose(
+    transform = transform or transforms.Compose(
         [
             transforms.Resize(image_size),
             transforms.ToTensor(),
@@ -354,12 +366,7 @@ def finetune_encoder_with_samples(
     )
 
     # Dataset and Dataloader
-    if file_path == "mnist":
-        dataset = datasets.MNIST(root="dataset/", transform=transform, download=True)
-    elif file_path == "celeba":
-        dataset = datasets.ImageFolder(root="celeb_dataset", transform=transforms)
-    else:
-        dataset = dataloader.H5Loader(file_path)
+    dataset = get_dataset(file_path=file_path, transform=transform)
 
     data_loader = DataLoader(
         dataset,
@@ -474,18 +481,15 @@ def test_encoder(
     batch_size=128,
     image_size=64,
     device=None,
+    transform=None,
     file_path="shoes_images/shoes.hdf5",
     save_dir="networks/",
     train_log_dir="dcgan_log_dir",
 ):
-    # Define device
-    if device is None:  # Default
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(device)
+    device = get_device(device)
 
     # Transforms
-    transform = transforms.Compose(
+    transform = transform or transforms.Compose(
         [
             transforms.Resize(image_size),
             transforms.ToTensor(),
@@ -496,12 +500,7 @@ def test_encoder(
     )
 
     # Dataset and Dataloader
-    if file_path == "mnist":
-        dataset = datasets.MNIST(root="dataset/", transform=transform, download=True)
-    elif file_path == "celeba":
-        dataset = datasets.ImageFolder(root="celeb_dataset", transform=transforms)
-    else:
-        dataset = dataloader.H5Loader(file_path)
+    dataset = get_dataset(file_path=file_path, transform=transform)
 
     data_loader = DataLoader(
         dataset,
@@ -559,6 +558,7 @@ def test_encoder(
     nrow = out_images.shape[1]
     out_images = out_images.reshape(-1, *x.shape[1:])
     train_log_dir = Path(train_log_dir)
+    train_log_dir.mkdir(exist_ok=True, parents=True)
     if not os.path.exists(train_log_dir):
         os.makedirs(train_log_dir)
     save_image(
@@ -576,19 +576,28 @@ if __name__ == "__main__":
     NUM_FILTERS = [256, 128, 64, 32]
     CHANNELS_IMG = 1
     BATCH_SIZE = 64
-    FILE_PATH = "mnist"
-    SAVE_DIR = "networks/MNIST"
-    SUMMARY_WRITER_DIR = "logs/WGANGP_MNIST"
+    IMAGE_SIZE = 64
+    NUM_EPOCHS = 100
+    FILE_PATH = (
+        "/home/fmunoz/codeProjects/pythonProjects/wgan-gp/dataset/quick_draw/face.npy"
+    )
+    # FILE_PATH = "mnist"
+    SAVE_DIR = "networks/face"
+    SUMMARY_WRITER_DIR = "logs/face"
+    TRANSFORM = None
 
     train_gan(
         latent_dim=LATENT_DIM,
         num_filters=NUM_FILTERS,
         channels_img=CHANNELS_IMG,
+        image_size=IMAGE_SIZE,
         learning_rate=3e-4,
         batch_size=BATCH_SIZE,
+        num_epochs=NUM_EPOCHS,
         file_path=FILE_PATH,
         save_dir=SAVE_DIR,
         summary_writer_dir=SUMMARY_WRITER_DIR,
+        transform=TRANSFORM,
     )
 
     train_encoder_with_noise(
@@ -597,9 +606,12 @@ if __name__ == "__main__":
         channels_img=CHANNELS_IMG,
         learning_rate=3e-4,
         batch_size=BATCH_SIZE,
+        image_size=IMAGE_SIZE,
+        num_epochs=NUM_EPOCHS,
         file_path=FILE_PATH,
         save_dir=SAVE_DIR,
         summary_writer_dir=SUMMARY_WRITER_DIR,
+        transform=TRANSFORM,
     )
 
     finetune_encoder_with_samples(
@@ -608,9 +620,12 @@ if __name__ == "__main__":
         channels_img=CHANNELS_IMG,
         learning_rate=3e-4,
         batch_size=BATCH_SIZE,
+        image_size=IMAGE_SIZE,
+        num_epochs=NUM_EPOCHS,
         file_path=FILE_PATH,
         save_dir=SAVE_DIR,
         summary_writer_dir=SUMMARY_WRITER_DIR,
+        transform=TRANSFORM,
     )
 
     # test_encoder(
