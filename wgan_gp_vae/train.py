@@ -19,6 +19,8 @@ from torchvision.utils import save_image
 from tqdm import tqdm
 from utils import alexnet_norm, denorm, gradient_penalty
 
+NUM_WORKERS = 0
+
 
 def get_device(device=None) -> torch.device:
     """Gets the device, or set a device if None is provided. Always prefer cuda."""
@@ -92,6 +94,7 @@ def train_gan(
         dataset,
         batch_size=batch_size,
         shuffle=True,
+        num_workers=NUM_WORKERS,
     )
 
     # Models
@@ -246,6 +249,7 @@ def train_encoder_with_noise(
         dataset,
         batch_size=batch_size,
         shuffle=True,
+        num_workers=NUM_WORKERS,
     )
 
     # Load generator and fix weights
@@ -372,6 +376,7 @@ def finetune_encoder_with_samples(
         dataset,
         batch_size=batch_size,
         shuffle=True,
+        num_workers=NUM_WORKERS,
     )
 
     # load alexnet:
@@ -506,6 +511,7 @@ def test_encoder(
         dataset,
         batch_size=batch_size,
         shuffle=True,
+        num_workers=NUM_WORKERS,
     )
 
     # load alexnet:
@@ -573,9 +579,9 @@ def test_encoder(
 
 if __name__ == "__main__":
     LATENT_DIM = 100
-    NUM_FILTERS = [512, 256, 128, 64]
+    NUM_FILTERS = [256, 128, 64, 32]
     CHANNELS_IMG = 1
-    BATCH_SIZE = 128
+    BATCH_SIZE = 256
     IMAGE_SIZE = 64
     NUM_EPOCHS = 100
     FILE_PATH = (

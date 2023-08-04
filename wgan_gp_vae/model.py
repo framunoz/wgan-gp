@@ -75,8 +75,8 @@ class Generator(nn.Module):
         return out
 
 
-# Discriminator model
-class Discriminator(nn.Module):
+# critic model
+class Critic(nn.Module):
     def __init__(self, channels_img=3, num_filters: Optional[List[int]] = None):
         super().__init__()
 
