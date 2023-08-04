@@ -4,6 +4,6 @@
 /logs
 /mnist_log_dir
 /runs
-*/__pycache__
+__pycache__/
 /.venv
 /.quickdrawcache
