@@ -1,3 +1,4 @@
+import multiprocessing as mp
 import os
 from pathlib import Path
 from typing import Literal
@@ -19,7 +20,7 @@ from torchvision.utils import save_image
 from tqdm import tqdm
 from utils import alexnet_norm, denorm, gradient_penalty
 
-NUM_WORKERS = 0
+NUM_WORKERS = mp.cpu_count()
 
 
 def get_device(device=None) -> torch.device:
@@ -53,6 +54,10 @@ def get_dataset(file_path: str, transform):
     return dataset
 
 
+def sample_noise(n_dim, z_dim, device="cpu"):
+    return torch.randn(n_dim, z_dim, 1, 1).to(device)
+
+
 # Training methods
 def train_gan(
     latent_dim,  # =100
@@ -73,6 +78,7 @@ def train_gan(
     save_dir="networks/",
     summary_writer_dir="logs",
     verbose=True,
+    report_every=100,
 ):
     device = get_device(device)
 
@@ -116,7 +122,7 @@ def train_gan(
     )
 
     # for tensorboard plotting
-    fixed_noise = 2 * torch.rand(32, latent_dim, 1, 1).to(device) - 1
+    fixed_noise = sample_noise(32, latent_dim, device)
     summary_writer_dir = Path(summary_writer_dir)
     summary_writer_dir.mkdir(exist_ok=True, parents=True)
     writer_real = SummaryWriter(summary_writer_dir / "real")
@@ -153,7 +159,7 @@ def train_gan(
             # Train Critic: max E[critic(real)] - E[critic(fake)]
             # equivalent to minimizing the negative of that
             for _ in range(disc_iterations):
-                noise = 2 * torch.rand(cur_batch_size, latent_dim, 1, 1).to(device) - 1
+                noise = sample_noise(cur_batch_size, latent_dim, device)
                 fake = G(noise)
                 critic_real = C(real).reshape(-1)
                 critic_fake = C(fake).reshape(-1)
@@ -178,7 +184,7 @@ def train_gan(
             G_epoch_losses.append(G_loss.data.item())
 
             # Print losses occasionally and print to tensorboard
-            if batch_idx % 100 == 0 and batch_idx > 0:
+            if batch_idx % report_every == 0 and batch_idx > 0:
                 with torch.no_grad():
                     fake = G(fixed_noise)
                     # take out (up to) 32 examples
@@ -228,6 +234,7 @@ def train_encoder_with_noise(
     save_dir="networks/",
     summary_writer_dir="logs",
     verbose=True,
+    report_every=100,
 ):
     device = get_device(device)
 
@@ -297,7 +304,7 @@ def train_encoder_with_noise(
         # minibatch training
         for batch_idx, (real, _) in iterable:
             # generate_noise
-            z = 2 * torch.rand(real.shape[0], latent_dim, 1, 1).to(device) - 1
+            z = sample_noise(real.shape[0], latent_dim, device)
             fake = G(z)
 
             # Train Encoder
@@ -312,7 +319,7 @@ def train_encoder_with_noise(
             # loss values
             E_losses.append(E_loss.data.item())
 
-            if batch_idx % 100 == 0 and batch_idx > 0:
+            if batch_idx % report_every == 0 and batch_idx > 0:
                 with torch.no_grad():
                     real = real.to(device)
                     fake = G(E(real))
@@ -355,6 +362,7 @@ def finetune_encoder_with_samples(
     save_dir="networks/",
     summary_writer_dir="logs",
     verbose=True,
+    report_every=100,
 ):
     device = get_device(device)
 
@@ -452,7 +460,7 @@ def finetune_encoder_with_samples(
             # loss values
             E_losses.append(E_loss.data.item())
 
-            if batch_idx % 100 == 0 and batch_idx > 0:
+            if batch_idx % report_every == 0 and batch_idx > 0:
                 with torch.no_grad():
                     real = real.to(device)
                     fake = G(E(real))
@@ -578,19 +586,33 @@ def test_encoder(
 
 
 if __name__ == "__main__":
+    IMAGE_SIZE = (size_x, size_y) = (64, 64)
     LATENT_DIM = 100
     NUM_FILTERS = [256, 128, 64, 32]
     CHANNELS_IMG = 1
     BATCH_SIZE = 256
-    IMAGE_SIZE = 64
     NUM_EPOCHS = 100
+    REPORT_EVERY = 50
     FILE_PATH = (
         "/home/fmunoz/codeProjects/pythonProjects/wgan-gp/dataset/quick_draw/face.npy"
     )
     # FILE_PATH = "mnist"
-    SAVE_DIR = "networks/face"
-    SUMMARY_WRITER_DIR = "logs/face"
-    TRANSFORM = None
+    NAME_DIR = f"face_{size_x}p{size_y}_zDim{LATENT_DIM}_gauss"
+    SAVE_DIR = Path("networks") / NAME_DIR
+    SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
+    TRANSFORM = transforms.Compose(
+        [
+            transforms.Resize(IMAGE_SIZE),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                # [0.20510 for _ in range(CHANNELS_IMG)],
+                # [0.34609 for _ in range(CHANNELS_IMG)],
+                [0.5 for _ in range(CHANNELS_IMG)],
+                [0.5 for _ in range(CHANNELS_IMG)],
+            ),
+        ]
+    )
+    MILESTONES = [33, 66]
 
     train_gan(
         latent_dim=LATENT_DIM,
@@ -604,13 +626,15 @@ if __name__ == "__main__":
         save_dir=SAVE_DIR,
         summary_writer_dir=SUMMARY_WRITER_DIR,
         transform=TRANSFORM,
+        report_every=REPORT_EVERY,
+        milestones=MILESTONES,
     )
 
     train_encoder_with_noise(
         latent_dim=LATENT_DIM,
         num_filters=NUM_FILTERS,
         channels_img=CHANNELS_IMG,
-        learning_rate=3e-4,
+        learning_rate=2e-4,
         batch_size=BATCH_SIZE,
         image_size=IMAGE_SIZE,
         num_epochs=NUM_EPOCHS,
@@ -618,13 +642,14 @@ if __name__ == "__main__":
         save_dir=SAVE_DIR,
         summary_writer_dir=SUMMARY_WRITER_DIR,
         transform=TRANSFORM,
+        report_every=REPORT_EVERY,
     )
 
     finetune_encoder_with_samples(
         latent_dim=LATENT_DIM,
         num_filters=NUM_FILTERS,
         channels_img=CHANNELS_IMG,
-        learning_rate=3e-4,
+        learning_rate=2e-4,
         batch_size=BATCH_SIZE,
         image_size=IMAGE_SIZE,
         num_epochs=NUM_EPOCHS,
@@ -632,6 +657,7 @@ if __name__ == "__main__":
         save_dir=SAVE_DIR,
         summary_writer_dir=SUMMARY_WRITER_DIR,
         transform=TRANSFORM,
+        report_every=REPORT_EVERY,
     )
 
     # test_encoder(
