@@ -1,5 +1,6 @@
+import abc
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 import torch.nn as nn
@@ -97,14 +98,17 @@ class ProjectorOnManifold:
                 transforms.Lambda(lambda x: x / torch.max(x)),
                 transforms.ToPILImage(),
                 transforms.Resize(image_size[1:]),
-                # transforms.ToTensor(),
+                transforms.ToTensor(),
                 transforms.Lambda(lambda x: x / torch.sum(x)),
             ]
         )
 
     def forward(self, x):
-        x = torch.unsqueeze(self._transform_in(x), 0)
-        x = torch.squeeze(self.generator(self.encoder(x)))
+        x = self._transform_in(x).to(x.device)
+        x = torch.unsqueeze(x, 0)
+        x = self.encoder(x)
+        x = self.generator(x)
+        x = torch.squeeze(x)
         x = self._transform_out(x)
         return x
 
