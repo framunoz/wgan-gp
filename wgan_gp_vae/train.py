@@ -11,7 +11,7 @@ import torch.optim as optim
 import torchvision
 import torchvision.datasets as datasets
 import torchvision.models as models
-import torchvision.transforms as transforms
+import torchvision.transforms as T
 from model import Critic, Encoder, Generator
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
@@ -21,6 +21,11 @@ from tqdm import tqdm
 from utils import alexnet_norm, denorm, gradient_penalty
 
 NUM_WORKERS = mp.cpu_count()
+NOISE_NAME = "gauss"
+
+
+def sample_noise(n_dim, z_dim, device="cpu"):
+    return torch.randn(n_dim, z_dim, 1, 1).to(device)
 
 
 def get_device(device=None) -> torch.device:
@@ -54,10 +59,6 @@ def get_dataset(file_path: str, transform):
     return dataset
 
 
-def sample_noise(n_dim, z_dim, device="cpu"):
-    return torch.randn(n_dim, z_dim, 1, 1).to(device)
-
-
 # Training methods
 def train_gan(
     latent_dim,  # =100
@@ -83,11 +84,11 @@ def train_gan(
     device = get_device(device)
 
     # Transforms
-    transform = transform or transforms.Compose(
+    transform = transform or T.Compose(
         [
-            transforms.Resize(image_size),
-            transforms.ToTensor(),
-            transforms.Normalize(
+            T.Resize(image_size),
+            T.ToTensor(),
+            T.Normalize(
                 [0.5 for _ in range(channels_img)], [0.5 for _ in range(channels_img)]
             ),
         ]
@@ -142,6 +143,7 @@ def train_gan(
     G.train()
 
     for epoch in range(num_epochs):
+        epoch_wass_dist = []
         C_epoch_losses = []
         G_epoch_losses = []
 
@@ -164,10 +166,8 @@ def train_gan(
                 critic_real = C(real).reshape(-1)
                 critic_fake = C(fake).reshape(-1)
                 gp = gradient_penalty(C, real, fake, device=device)
-                C_loss = (
-                    -(torch.mean(critic_real) - torch.mean(critic_fake))
-                    + lambda_gp * gp
-                )
+                wasserstein_dist = torch.mean(critic_real) - torch.mean(critic_fake)
+                C_loss = -wasserstein_dist + lambda_gp * gp
                 C.zero_grad()
                 C_loss.backward(retain_graph=True)
                 C_optimizer.step()
@@ -180,6 +180,7 @@ def train_gan(
             G_optimizer.step()
 
             # loss values
+            epoch_wass_dist.append(wasserstein_dist.data.item())
             C_epoch_losses.append(C_loss.data.item())
             G_epoch_losses.append(G_loss.data.item())
 
@@ -196,15 +197,21 @@ def train_gan(
                     )
 
                     loss_C_name, loss_G_name = "Loss Discriminator", "Loss Generator"
+                    wass_dist_name = "Wasserstein Distance"
                     writer_real.add_image("Real", img_grid_real, global_step=step)
                     writer_fake.add_image("Fake", img_grid_fake, global_step=step)
                     writer_loss.add_scalar(loss_C_name, C_loss, global_step=step)
                     writer_loss.add_scalar(loss_G_name, G_loss, global_step=step)
+                    writer_loss.add_scalar(
+                        wass_dist_name, wasserstein_dist, global_step=step
+                    )
 
                 step += 1
 
+        avg_wass_dist = torch.mean(torch.FloatTensor(epoch_wass_dist)).item()
         C_avg_loss = torch.mean(torch.FloatTensor(C_epoch_losses)).item()
         G_avg_loss = torch.mean(torch.FloatTensor(G_epoch_losses)).item()
+        writer_loss.add_scalar("Average Wasserstein Distance", avg_wass_dist, epoch)
         writer_loss.add_scalar("Average loss Discriminator", C_avg_loss, epoch)
         writer_loss.add_scalar("Average loss Generator", G_avg_loss, epoch)
 
@@ -239,11 +246,11 @@ def train_encoder_with_noise(
     device = get_device(device)
 
     # Transforms
-    transform = transform or transforms.Compose(
+    transform = transform or T.Compose(
         [
-            transforms.Resize(image_size),
-            transforms.ToTensor(),
-            transforms.Normalize(
+            T.Resize(image_size),
+            T.ToTensor(),
+            T.Normalize(
                 [0.5 for _ in range(channels_img)], [0.5 for _ in range(channels_img)]
             ),
         ]
@@ -367,11 +374,11 @@ def finetune_encoder_with_samples(
     device = get_device(device)
 
     # Transforms
-    transform = transform or transforms.Compose(
+    transform = transform or T.Compose(
         [
-            transforms.Resize(image_size),
-            transforms.ToTensor(),
-            transforms.Normalize(
+            T.Resize(image_size),
+            T.ToTensor(),
+            T.Normalize(
                 [0.5 for _ in range(channels_img)], [0.5 for _ in range(channels_img)]
             ),
         ]
@@ -502,11 +509,11 @@ def test_encoder(
     device = get_device(device)
 
     # Transforms
-    transform = transform or transforms.Compose(
+    transform = transform or T.Compose(
         [
-            transforms.Resize(image_size),
-            transforms.ToTensor(),
-            transforms.Normalize(
+            T.Resize(image_size),
+            T.ToTensor(),
+            T.Normalize(
                 [0.5 for _ in range(channels_img)], [0.5 for _ in range(channels_img)]
             ),
         ]
@@ -587,32 +594,32 @@ def test_encoder(
 
 if __name__ == "__main__":
     IMAGE_SIZE = (size_x, size_y) = (64, 64)
-    LATENT_DIM = 100
+    LATENT_DIM = 128
     NUM_FILTERS = [256, 128, 64, 32]
     CHANNELS_IMG = 1
     BATCH_SIZE = 256
-    NUM_EPOCHS = 100
+    NUM_EPOCHS = 150
     REPORT_EVERY = 50
-    FILE_PATH = (
-        "/home/fmunoz/codeProjects/pythonProjects/wgan-gp/dataset/quick_draw/face.npy"
-    )
+    FILE_PATH = "/home/fmunoz/codeProjects/pythonProjects/wgan-gp/dataset/quick_draw/face_recognized.npy"
     # FILE_PATH = "mnist"
-    NAME_DIR = f"face_{size_x}p{size_y}_zDim{LATENT_DIM}_gauss"
+    NAME_DIR = (
+        f"face_zDim{LATENT_DIM}_{NOISE_NAME}_recognized_augmented_{size_x}p{size_y}"
+    )
     SAVE_DIR = Path("networks") / NAME_DIR
     SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
-    TRANSFORM = transforms.Compose(
+    TRANSFORM = T.Compose(
         [
-            transforms.Resize(IMAGE_SIZE),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                # [0.20510 for _ in range(CHANNELS_IMG)],
-                # [0.34609 for _ in range(CHANNELS_IMG)],
+            T.Resize(IMAGE_SIZE),
+            T.RandomHorizontalFlip(p=0.5),
+            T.RandomRotation(degrees=(-7, 7)),
+            T.ToTensor(),
+            T.Normalize(
                 [0.5 for _ in range(CHANNELS_IMG)],
                 [0.5 for _ in range(CHANNELS_IMG)],
             ),
         ]
     )
-    MILESTONES = [33, 66]
+    MILESTONES = [50, 100]
 
     train_gan(
         latent_dim=LATENT_DIM,
