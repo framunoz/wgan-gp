@@ -1,14 +1,14 @@
+import abc
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
 
-from wgan_gp_vae.model import Encoder, Generator
-
 _models_option = "encoder", "generator"
 TypeModels = Literal["encoder", "generator"]
+
 
 def gradient_penalty(critic, real, fake, device="cpu"):
     device = torch.device(device)
@@ -34,20 +34,15 @@ def gradient_penalty(critic, real, fake, device="cpu"):
 
 
 def load_checkpoint(
-        model: nn.Module, 
-        root_path: str | Path, 
-        type_model: TypeModels, 
-        device=None
-        ):
+    model: nn.Module, root_path: str | Path, type_model: TypeModels, device=None
+):
     if type_model not in _models_option:
         raise ValueError(f"Choose one of the options: {_models_option}.")
     source_path = Path(root_path) / type_model
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model.load_state_dict(
-        torch.load(source_path, map_location=device)
-    )
+    model.load_state_dict(torch.load(source_path, map_location=device))
     model.eval()
 
     return model
@@ -67,11 +62,20 @@ def denorm(x):
     return out.clamp(0, 1)
 
 
-class ProjectorOnManifold:
+class BaseProjectorOnManifold(abc.ABC):
+    @abc.abstractmethod
+    def forward(self, x):
+        ...
+
+    def __call__(self, x):
+        return self.forward(x)
+
+
+class ProjectorOnManifold(BaseProjectorOnManifold):
     def __init__(
         self,
-        encoder: Encoder,
-        generator: Generator,
+        encoder,
+        generator,
         image_size: tuple[int, int, int] = (1, 28, 28),
         image_size_net: tuple[int, int, int] = (1, 64, 64),
         transform_in=None,
@@ -82,34 +86,37 @@ class ProjectorOnManifold:
         self.img_size = image_size
         self._img_size_net = image_size_net
         channels_img = image_size_net[0]
-        self._transform_in = transform_in or transforms.Compose([
-            # From pdf to grayscale
-            transforms.Lambda(lambda x: x / torch.max(x)),
-            # transforms.Lambda(lambda x: x),
-            transforms.ToPILImage(),
-            transforms.Resize(image_size_net[1:]),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                [0.5 for _ in range(channels_img)],
-                [0.5 for _ in range(channels_img)]
-            ),
-        ])
-        self._transform_out = transform_out or transforms.Compose([
-            # Ensure the range is in [0, 1]
-            transforms.Lambda(lambda x: x - torch.min(x)),
-            transforms.Lambda(lambda x: x / torch.max(x)),
-            transforms.ToPILImage(),
-            transforms.Resize(image_size[1:]),
-            # transforms.ToTensor(),
-            transforms.Lambda(lambda x: x / torch.sum(x)),
-        ])
+        self._transform_in = transform_in or transforms.Compose(
+            [
+                # From pdf to grayscale
+                transforms.Lambda(lambda x: x / torch.max(x)),
+                # transforms.Lambda(lambda x: x),
+                transforms.ToPILImage(),
+                transforms.Resize(image_size_net[1:]),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    [0.5 for _ in range(channels_img)],
+                    [0.5 for _ in range(channels_img)],
+                ),
+            ]
+        )
+        self._transform_out = transform_out or transforms.Compose(
+            [
+                # Ensure the range is in [0, 1]
+                transforms.Lambda(lambda x: x - torch.min(x)),
+                transforms.Lambda(lambda x: x / torch.max(x)),
+                transforms.ToPILImage(),
+                transforms.Resize(image_size[1:]),
+                transforms.ToTensor(),
+                transforms.Lambda(lambda x: x / torch.sum(x)),
+            ]
+        )
 
     def forward(self, x):
-        x = torch.unsqueeze(self._transform_in(x), 0)
-        x = torch.squeeze(self.generator(self.encoder(x)))
+        x = self._transform_in(x).to(x.device)
+        x = torch.unsqueeze(x, 0)
+        x = self.encoder(x)
+        x = self.generator(x)
+        x = torch.squeeze(x)
         x = self._transform_out(x)
         return x
-
-    def __call__(self, x):
-        return self.forward(x)
-    
