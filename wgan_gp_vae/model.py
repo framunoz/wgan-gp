@@ -1,17 +1,36 @@
-from typing import List, Optional
+from typing import Iterable, Literal
 
 import torch
 import torch.nn as nn
 
 
+def _unif(n_dim, z_dim, device="cpu"):
+    return 2 * torch.rand(n_dim, z_dim, 1, 1).to(device) - 1
+
+
+def _norm(n_dim, z_dim, device="cpu"):
+    return torch.randn(n_dim, z_dim, 1, 1).to(device)
+
+
+_LATENT_DISTR = {
+    "unif": _unif,
+    "norm": _norm,
+}
+
+
 # Generator model
 class Generator(nn.Module):
+    latent_distr: Literal["unif", "norm"] = "norm"
+
     def __init__(
-        self, latent_dim, channels_img=3, num_filters: Optional[List[int]] = None
+        self,
+        latent_dim,
+        channels_img=3,
+        num_filters: Iterable[int] = (256, 128, 64, 32),
     ) -> None:
         super().__init__()
 
-        num_filters = num_filters if num_filters is not None else [128, 64, 32, 16]
+        self.latent_dim = latent_dim
 
         # Hidden layers
         self.hidden_layer = nn.Sequential()
@@ -69,18 +88,23 @@ class Generator(nn.Module):
         # Activation
         self.output_layer.add_module("act_out", nn.Tanh())
 
+    @property
+    def device(self) -> torch.device:
+        return next(self.parameters()).device
+
     def forward(self, x):
         x = self.hidden_layer(x)
         out = self.output_layer(x)
         return out
 
+    def sample_noise(self, n: int) -> torch.Tensor:
+        return _LATENT_DISTR[self.latent_distr](n, self.latent_dim, self.device)
+
 
 # critic model
 class Critic(nn.Module):
-    def __init__(self, channels_img=3, num_filters: Optional[List[int]] = None):
+    def __init__(self, channels_img=3, num_filters: Iterable[int] = (32, 64, 128, 256)):
         super().__init__()
-
-        num_filters = num_filters if num_filters is not None else [8, 16, 32, 64]
 
         # Hidden layers
         self.hidden_layer = nn.Sequential()
@@ -136,8 +160,6 @@ class Critic(nn.Module):
         # Initializer
         nn.init.normal_(out.weight.data, mean=0.0, std=0.02)
         nn.init.constant_(out.bias.data, 0.0)
-        # Activation
-        # self.output_layer.add_module("act", nn.Sigmoid())
 
     def forward(self, x):
         x = self.hidden_layer(x)
@@ -148,11 +170,12 @@ class Critic(nn.Module):
 # Encoder model
 class Encoder(nn.Module):
     def __init__(
-        self, latent_dim, channels_img=3, num_filters: Optional[List[int]] = None
+        self,
+        latent_dim,
+        channels_img=3,
+        num_filters: Iterable[int] = (32, 64, 128, 256),
     ):
         super().__init__()
-
-        num_filters = num_filters if num_filters is not None else [16, 32, 64, 128]
 
         # Hidden layers
         self.hidden_layer = nn.Sequential()
@@ -231,9 +254,9 @@ def _test():
     gen = Generator(latent_dim, in_channels, [128, 64, 32, 16]).to(dev)
     assert gen(z).shape == (N, in_channels, H, W), "Generator test failed"
 
-    # Discriminator test
-    disc = Discriminator(in_channels, [8, 16, 32, 64]).to(dev)
-    assert disc(x).shape == (N, 1, 1, 1), "Discriminatior test failed"
+    # Critic test
+    critic = Critic(in_channels, [8, 16, 32, 64]).to(dev)
+    assert critic(x).shape == (N, 1, 1, 1), "Critic test failed"
 
     # Encoder
     enc = Encoder(latent_dim, in_channels, [16, 32, 64, 128]).to(dev)

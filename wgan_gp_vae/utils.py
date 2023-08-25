@@ -62,6 +62,107 @@ def denorm(x):
     return out.clamp(0, 1)
 
 
+def compute_distances(
+    X: torch.Tensor,
+    Y: torch.Tensor,
+):
+    """
+    Computes the distances of the tensors X and Y, where their dimensions
+    are (batch_size, z_dim).
+
+    Returns three distances matrices, where the first one is asociated with X,
+    the second one with Y and the third one is the distance between X and Y.
+    Each distance matrix has dimensions (batch_size, batch_size).
+    """
+    norms_x = X.pow(2).sum(1, keepdim=True)  # batch_size x 1
+    prods_x = torch.mm(X, X.t())  # batch_size x batch_size
+    dists_x = norms_x + norms_x.t() - 2 * prods_x
+
+    norms_y = Y.pow(2).sum(1, keepdim=True)  # batch_size x 1
+    prods_y = torch.mm(Y, Y.t())  # batch_size x batch_size
+    dists_y = norms_y + norms_y.t() - 2 * prods_y
+
+    dot_prd = torch.mm(X, Y.t())
+    dists_c = norms_x + norms_y.t() - 2 * dot_prd
+
+    return dists_x, dists_y, dists_c
+
+
+def imq_kernel(
+    X: torch.Tensor,
+    Y: torch.Tensor,
+    scale: float = 1.0,
+    p_distr: str = "norm",
+):
+    """
+    Computes the MMD using the inverse multiquadratics kernel.
+    Code inspired from https://github.com/schelotto/Wasserstein-AutoEncoders/blob/master/wae_mmd.py#L120
+
+    X, Y (tensors): Tensors with size (batch_size, z_dim, 1, 1)
+    """
+    X, Y = X.squeeze(2, 3), Y.squeeze(2, 3)
+    device = X.device
+    sigma2_p = scale**2
+    nf, z_dim = X.shape
+
+    dists_x, dists_y, dists_c = compute_distances(X, Y)
+
+    # Compute MMD using imq kernel
+    match p_distr:
+        case "norm":
+            Cbase = 2.0 * z_dim * sigma2_p
+        case "unif":
+            Cbase = z_dim
+
+    to_return = 0.0
+    for scale in [0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0]:
+        C = Cbase * scale  # According to the paper
+
+        res1 = C / (C + dists_x)
+        res1 += C / (C + dists_y)
+        res1 *= 1 - torch.eye(nf).to(device)
+        res1 = res1.sum() / (nf * nf - nf)
+
+        res2 = C / (C + dists_c)
+        res2 = 2.0 * res2.sum() / (nf * nf)
+
+        to_return += res1 - res2
+
+    return to_return
+
+
+def rbf_kernel(
+    X: torch.Tensor,
+    Y: torch.Tensor,
+    scale: float = 1.0,
+):
+    """
+    Computes the MMD using the RBF.
+    Code inspired from https://github.com/schelotto/Wasserstein-AutoEncoders/blob/master/wae_mmd.py#L120
+
+    X, Y (tensors): Tensors with size (batch_size, z_dim, 1, 1)
+    """
+    X, Y = X.squeeze(2, 3), Y.squeeze(2, 3)
+    sigma2_p = scale**2
+    device = X.device
+    n, z_dim = X.shape
+
+    dists_x, dists_y, dists_c = compute_distances(X, Y)
+
+    # Compute MMD using rbf kernel
+    res1 = torch.exp(-dists_x / sigma2_p)
+    res1 += torch.exp(-dists_y / sigma2_p)
+    res1 *= 1 - torch.eye(n).to(device)
+    res1 = res1.sum() / (n * n - n)
+
+    res2 = torch.exp(-dists_c / sigma2_p)
+    res2 = 2.0 * res2.sum() / (n * n)
+
+    to_return = res1 - res2
+
+    return to_return
+
+
 class ProjectorOnManifold:
     def __init__(
         self,

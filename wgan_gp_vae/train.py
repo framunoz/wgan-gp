@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import save_image
 from tqdm import tqdm
-from utils import alexnet_norm, denorm, gradient_penalty
+from utils import alexnet_norm, denorm, gradient_penalty, imq_kernel
 
 NUM_WORKERS = mp.cpu_count()
 NOISE_NAME = "gauss"
@@ -123,7 +123,7 @@ def train_gan(
     )
 
     # for tensorboard plotting
-    fixed_noise = sample_noise(32, latent_dim, device)
+    fixed_noise = G.sample_noise(32)
     summary_writer_dir = Path(summary_writer_dir)
     summary_writer_dir.mkdir(exist_ok=True, parents=True)
     writer_real = SummaryWriter(summary_writer_dir / "real")
@@ -161,7 +161,7 @@ def train_gan(
             # Train Critic: max E[critic(real)] - E[critic(fake)]
             # equivalent to minimizing the negative of that
             for _ in range(disc_iterations):
-                noise = sample_noise(cur_batch_size, latent_dim, device)
+                noise = G.sample_noise(cur_batch_size)
                 fake = G(noise)
                 critic_real = C(real).reshape(-1)
                 critic_fake = C(fake).reshape(-1)
@@ -226,7 +226,7 @@ def train_gan(
         C_scheduler.step()
 
 
-def train_encoder_with_noise(
+def _train_encoder_with_noise(
     latent_dim,  # =100
     num_filters,  # =[1024, 512, 256, 128]
     channels_img=3,
@@ -311,7 +311,7 @@ def train_encoder_with_noise(
         # minibatch training
         for batch_idx, (real, _) in iterable:
             # generate_noise
-            z = sample_noise(real.shape[0], latent_dim, device)
+            z = G.sample_noise(real.shape[0])
             fake = G(z)
 
             # Train Encoder
@@ -347,6 +347,153 @@ def train_encoder_with_noise(
                 step += 1
 
         E_avg_loss = torch.mean(torch.FloatTensor(E_losses)).item()
+        writer_loss.add_scalar("Average loss Encoder", E_avg_loss, epoch)
+
+        # Save models
+        torch.save(E.state_dict(), save_dir / "encoder")
+
+
+def train_encoder_with_wae(
+    latent_dim,  # =100
+    num_filters,  # =[1024, 512, 256, 128]
+    channels_img=3,
+    learning_rate=2e-4,
+    batch_size=128,
+    image_size=64,
+    num_epochs=100,
+    reg_mmd=10,
+    betas=(0.5, 0.999),
+    device=None,
+    transform=None,
+    file_path="shoes_images/shoes.hdf5",
+    save_dir="networks/",
+    summary_writer_dir="logs",
+    verbose=True,
+    report_every=100,
+):
+    device = get_device(device)
+
+    # Transforms
+    transform = transform or T.Compose(
+        [
+            T.Resize(image_size),
+            T.ToTensor(),
+            T.Normalize(
+                [0.5 for _ in range(channels_img)], [0.5 for _ in range(channels_img)]
+            ),
+        ]
+    )
+
+    # Dataset and Dataloader
+    dataset = get_dataset(file_path=file_path, transform=transform)
+
+    data_loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+    )
+
+    # Load generator and fix weights
+    G = Generator(latent_dim, channels_img, num_filters).to(device)
+    save_dir = Path(save_dir)
+    generator_path = save_dir / "generator"
+    G.load_state_dict(torch.load(generator_path))
+    G.eval()
+    for param in G.parameters():
+        param.requires_grad = False
+
+    E = Encoder(latent_dim, channels_img, num_filters[::-1]).to(device)
+
+    # Loss function
+    criterion = nn.MSELoss()
+
+    # Optimizer
+    E_optimizer = optim.Adam(
+        E.parameters(),
+        lr=learning_rate,
+        betas=betas,
+        weight_decay=1e-5,
+    )
+
+    # TODO: FALTA EL StepLR, aunque parece no ser importante
+
+    # for tensorboard plotting
+    summary_writer_dir = Path(summary_writer_dir)
+    summary_writer_dir.mkdir(exist_ok=True, parents=True)
+    writer_real = SummaryWriter(summary_writer_dir / "real_encoder")
+    writer_fake = SummaryWriter(summary_writer_dir / "fake_encoder")
+    writer_loss = SummaryWriter(summary_writer_dir / "loss_encoder")
+    step = 0
+
+    E.train()
+
+    for epoch in range(num_epochs):
+        epoch_wass_dist = []
+        E_losses = []
+
+        if verbose:
+            iterable = enumerate(
+                tqdm(data_loader, desc=f"Epoch [{epoch}/{num_epochs}]")
+            )
+        else:
+            iterable = enumerate(data_loader)
+
+        # minibatch training
+        for batch_idx, (real, _) in iterable:
+            real = real.to(device)
+            batch_size = real.shape[0]
+
+            # generate noise
+            z = G.sample_noise(
+                batch_size
+            )  # Generate {z_1, ..., z_n} from the prior P_z
+            z_tilde = E(real)  # Generate \tilde{z}_i from Q(Z|x_i) for i = 1:n
+            x_recon = G(z_tilde)
+
+            # According to the paper, this is the Wasserstein distance
+            wasserstein_dist = criterion(real, x_recon)
+
+            # Compute MMD
+            mmd_loss = imq_kernel(z, z_tilde, p_distr=G.latent_distr)
+
+            E_loss = wasserstein_dist + reg_mmd * mmd_loss
+
+            # Back propagation
+            E.zero_grad()
+            E_loss.backward()
+            E_optimizer.step()
+
+            # loss values
+            epoch_wass_dist.append(wasserstein_dist.data.item())
+            E_losses.append(E_loss.data.item())
+
+            if batch_idx % report_every == 0 and batch_idx > 0:
+                with torch.no_grad():
+                    fake = G(E(real))
+                    # take out (up to) 32 examples
+                    img_grid_real = torchvision.utils.make_grid(
+                        real[:32], normalize=True
+                    )
+                    img_grid_fake = torchvision.utils.make_grid(
+                        fake[:32], normalize=True
+                    )
+
+                    real_name, fake_name = "Real", "Generated by Encoder"
+                    loss_E_name = "Loss Encoder"
+                    wass_dist_name = "Wasserstein Distance"
+                    writer_real.add_image(real_name, img_grid_real, global_step=step)
+                    writer_fake.add_image(fake_name, img_grid_fake, global_step=step)
+                    writer_loss.add_scalar(loss_E_name, E_loss, global_step=step)
+                    writer_loss.add_scalar(
+                        wass_dist_name, wasserstein_dist, global_step=step
+                    )
+
+                step += 1
+
+        avg_wass_dist = torch.mean(torch.FloatTensor(epoch_wass_dist)).item()
+        E_avg_loss = torch.mean(torch.FloatTensor(E_losses)).item()
+        writer_loss.add_scalar("Average Wasserstein Distance", avg_wass_dist, epoch)
         writer_loss.add_scalar("Average loss Encoder", E_avg_loss, epoch)
 
         # Save models
@@ -621,23 +768,23 @@ if __name__ == "__main__":
     )
     MILESTONES = [50, 100]
 
-    train_gan(
-        latent_dim=LATENT_DIM,
-        num_filters=NUM_FILTERS,
-        channels_img=CHANNELS_IMG,
-        image_size=IMAGE_SIZE,
-        learning_rate=3e-4,
-        batch_size=BATCH_SIZE,
-        num_epochs=NUM_EPOCHS,
-        file_path=FILE_PATH,
-        save_dir=SAVE_DIR,
-        summary_writer_dir=SUMMARY_WRITER_DIR,
-        transform=TRANSFORM,
-        report_every=REPORT_EVERY,
-        milestones=MILESTONES,
-    )
+    # train_gan(
+    #     latent_dim=LATENT_DIM,
+    #     num_filters=NUM_FILTERS,
+    #     channels_img=CHANNELS_IMG,
+    #     image_size=IMAGE_SIZE,
+    #     learning_rate=3e-4,
+    #     batch_size=BATCH_SIZE,
+    #     num_epochs=NUM_EPOCHS,
+    #     file_path=FILE_PATH,
+    #     save_dir=SAVE_DIR,
+    #     summary_writer_dir=SUMMARY_WRITER_DIR,
+    #     transform=TRANSFORM,
+    #     report_every=REPORT_EVERY,
+    #     milestones=MILESTONES,
+    # )
 
-    train_encoder_with_noise(
+    train_encoder_with_wae(
         latent_dim=LATENT_DIM,
         num_filters=NUM_FILTERS,
         channels_img=CHANNELS_IMG,
@@ -652,20 +799,20 @@ if __name__ == "__main__":
         report_every=REPORT_EVERY,
     )
 
-    finetune_encoder_with_samples(
-        latent_dim=LATENT_DIM,
-        num_filters=NUM_FILTERS,
-        channels_img=CHANNELS_IMG,
-        learning_rate=2e-4,
-        batch_size=BATCH_SIZE,
-        image_size=IMAGE_SIZE,
-        num_epochs=NUM_EPOCHS,
-        file_path=FILE_PATH,
-        save_dir=SAVE_DIR,
-        summary_writer_dir=SUMMARY_WRITER_DIR,
-        transform=TRANSFORM,
-        report_every=REPORT_EVERY,
-    )
+    # finetune_encoder_with_samples(
+    #     latent_dim=LATENT_DIM,
+    #     num_filters=NUM_FILTERS,
+    #     channels_img=CHANNELS_IMG,
+    #     learning_rate=2e-4,
+    #     batch_size=BATCH_SIZE,
+    #     image_size=IMAGE_SIZE,
+    #     num_epochs=NUM_EPOCHS,
+    #     file_path=FILE_PATH,
+    #     save_dir=SAVE_DIR,
+    #     summary_writer_dir=SUMMARY_WRITER_DIR,
+    #     transform=TRANSFORM,
+    #     report_every=REPORT_EVERY,
+    # )
 
     # test_encoder(
     #     latent_dim=LATENT_DIM,
