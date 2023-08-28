@@ -226,6 +226,263 @@ def train_gan(
         C_scheduler.step()
 
 
+# Training methods
+def train_wgan_and_wae(
+    latent_dim,  # =100
+    num_filters,  # =[1024, 512, 256, 128]
+    channels_img=3,
+    learning_rate=1e-4,
+    batch_size=128,
+    image_size=64,
+    num_epochs=100,
+    critic_iterations=5,
+    reg_gp=10,
+    reg_mmd=10,
+    criterion: Literal["mse", "l1"] = "l1",
+    betas=(0.0, 0.9),
+    weight_decay=1e-5,
+    milestones=[25, 50, 75],
+    device=None,
+    transform=None,
+    file_path: str | Literal["mnist", "celeba"] = "shoes_images/shoes.hdf5",
+    save_dir="networks/",
+    summary_writer_dir="logs",
+    verbose=True,
+    report_every=100,
+):
+    device = get_device(device)
+
+    # Transforms
+    transform = transform or T.Compose(
+        [
+            T.Resize(image_size),
+            T.ToTensor(),
+            T.Normalize(
+                [0.5 for _ in range(channels_img)], [0.5 for _ in range(channels_img)]
+            ),
+        ]
+    )
+
+    # Dataset and Dataloader
+    dataset = get_dataset(file_path=file_path, transform=transform)
+
+    data_loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+    )
+
+    # Models
+    G = Generator(latent_dim, channels_img, num_filters).to(device)
+    C = Critic(channels_img, num_filters[::-1]).to(device)
+    E = Encoder(latent_dim, channels_img, num_filters[::-1]).to(device)
+
+    # Loss function for WAE
+    match criterion:
+        case "mse":
+            criterion = nn.MSELoss()
+        case "l1":
+            criterion = nn.L1Loss()
+        case _:
+            criterion = criterion
+
+    # Optimizers
+    G_optimizer = optim.Adam(
+        G.parameters(),
+        lr=learning_rate,
+        betas=betas,
+        weight_decay=weight_decay,
+    )
+    C_optimizer = optim.Adam(
+        C.parameters(),
+        lr=learning_rate,
+        betas=betas,
+        weight_decay=weight_decay,
+    )
+    # Optimizer
+    E_optimizer = optim.Adam(
+        E.parameters(),
+        lr=learning_rate,
+        betas=betas,
+        weight_decay=1e-5,
+    )
+
+    # for tensorboard plotting
+    fixed_noise = G.sample_noise(32)
+    summary_writer_dir = Path(summary_writer_dir)
+    summary_writer_dir.mkdir(exist_ok=True, parents=True)
+    writer_real = SummaryWriter(summary_writer_dir / "real")
+    writer_fake = SummaryWriter(summary_writer_dir / "fake")
+    writer_loss = SummaryWriter(summary_writer_dir / "loss")
+    step = 0
+
+    # Schedulers
+    # G_scheduler = optim.lr_scheduler.MultiStepLR(
+    #     G_optimizer, milestones=milestones, gamma=0.75
+    # )
+    # C_scheduler = optim.lr_scheduler.MultiStepLR(
+    #     C_optimizer, milestones=milestones, gamma=0.75
+    # )
+
+    C.train()
+    G.train()
+    E.train()
+
+    for epoch in range(num_epochs):
+        epoch_wass_dist_WGAN = []
+        epoch_wass_dist_WAE = []
+        C_epoch_losses = []
+        G_epoch_losses = []
+        E_epoch_losses = []
+
+        if verbose:
+            iterable = enumerate(
+                tqdm(data_loader, desc=f"Epoch [{epoch}/{num_epochs}]")
+            )
+        else:
+            iterable = enumerate(data_loader)
+
+        for batch_idx, (real, _) in iterable:
+            n = real.shape[0]
+            real = real.to(device)
+
+            # Train Critic: max E[critic(real)] - E[critic(fake)]
+            # equivalent to minimizing the negative of that
+            for _ in range(critic_iterations):
+                noise = G.sample_noise(n)
+                fake = G(noise)
+                critic_real = C(real).reshape(-1)
+                critic_fake = C(fake).reshape(-1)
+                gp = gradient_penalty(C, real, fake, device=device)
+                wasserstein_dist_WGAN = torch.mean(critic_real) - torch.mean(
+                    critic_fake
+                )
+                C_loss = -wasserstein_dist_WGAN + reg_gp * gp
+                C.zero_grad()
+                C_loss.backward(retain_graph=True)
+                C_optimizer.step()
+
+            # Train Generator: max E[critic(gen_fake)] <-> min -E[critic(gen_fake)]
+            gen_fake = C(fake).reshape(-1)
+            G_loss = -torch.mean(gen_fake)
+            G.zero_grad()
+            G_loss.backward()
+            G_optimizer.step()
+
+            # Train Encoder + Generator
+            # generate noise
+            z = G.sample_noise(n)  # Generate {z_1, ..., z_n} from the prior P_z
+            z_tilde = E(real)  # Generate \tilde{z}_i from Q(Z|x_i) for i = 1:n
+            x_recon = G(z_tilde)
+
+            # According to the paper, this is the Wasserstein distance
+            wasserstein_dist_WAE = criterion(real, x_recon)
+
+            # Compute MMD
+            mmd_loss = imq_kernel(z, z_tilde, p_distr=G.latent_distr)
+
+            E_loss = wasserstein_dist_WAE + reg_mmd * mmd_loss
+
+            # Back propagation
+            E.zero_grad()
+            G.zero_grad()
+            E_loss.backward()
+            E_optimizer.step()
+            G_optimizer.step()
+
+            # loss values
+            epoch_wass_dist_WGAN.append(wasserstein_dist_WGAN.data.item())
+            epoch_wass_dist_WAE.append(wasserstein_dist_WAE.data.item())
+
+            C_epoch_losses.append(C_loss.data.item())
+            G_epoch_losses.append(G_loss.data.item())
+            E_epoch_losses.append(E_loss.data.item())
+
+            # Print losses occasionally and print to tensorboard
+            if batch_idx % report_every == 0 and batch_idx > 0:
+                with torch.no_grad():
+                    fake_WGAN = G(fixed_noise)
+                    fake_WAE = G(E(real))
+                    # take out (up to) 32 examples
+                    img_grid_real = torchvision.utils.make_grid(
+                        real[:32], normalize=True
+                    )
+                    img_grid_fake_WGAN = torchvision.utils.make_grid(
+                        fake_WGAN[:32], normalize=True
+                    )
+                    img_grid_fake_WAE = torchvision.utils.make_grid(
+                        fake_WAE[:32], normalize=True
+                    )
+
+                    loss_C_name = "Loss Discriminator"
+                    loss_G_name = "Loss Generator"
+                    loss_E_name = "Loss Encoder"
+                    wass_dist_name_WGAN = "Wasserstein Distance WGAN"
+                    wass_dist_name_WAE = "Wasserstein Distance WAE"
+                    writer_real.add_image("Real", img_grid_real, global_step=step)
+                    writer_fake.add_image(
+                        "Generated", img_grid_fake_WGAN, global_step=step
+                    )
+                    writer_fake.add_image(
+                        "Decoded", img_grid_fake_WAE, global_step=step
+                    )
+                    writer_loss.add_scalars(
+                        loss_C_name, {loss_C_name: C_loss}, global_step=step
+                    )
+                    writer_loss.add_scalars(
+                        loss_G_name, {loss_G_name: G_loss}, global_step=step
+                    )
+                    writer_loss.add_scalars(
+                        loss_E_name, {loss_E_name: E_loss}, global_step=step
+                    )
+                    writer_loss.add_scalars(
+                        wass_dist_name_WGAN,
+                        {wass_dist_name_WGAN: wasserstein_dist_WGAN},
+                        global_step=step,
+                    )
+                    writer_loss.add_scalars(
+                        wass_dist_name_WAE,
+                        {wass_dist_name_WAE: wasserstein_dist_WAE},
+                        global_step=step,
+                    )
+
+                step += 1
+
+        global_epoch = step - 1
+        avg_wass_dist_WGAN = torch.mean(torch.FloatTensor(epoch_wass_dist_WGAN)).item()
+        avg_wass_dist_WAE = torch.mean(torch.FloatTensor(epoch_wass_dist_WAE)).item()
+        C_avg_loss = torch.mean(torch.FloatTensor(C_epoch_losses)).item()
+        G_avg_loss = torch.mean(torch.FloatTensor(G_epoch_losses)).item()
+        E_avg_loss = torch.mean(torch.FloatTensor(E_epoch_losses)).item()
+        writer_loss.add_scalars(
+            wass_dist_name_WGAN,
+            {"Avg. " + wass_dist_name_WGAN: avg_wass_dist_WGAN},
+            global_epoch,
+        )
+        writer_loss.add_scalars(
+            wass_dist_name_WAE,
+            {"Avg. " + wass_dist_name_WAE: avg_wass_dist_WAE},
+            global_epoch,
+        )
+        writer_loss.add_scalars(
+            loss_C_name, {"Avg. " + loss_C_name: C_avg_loss}, global_epoch
+        )
+        writer_loss.add_scalars(
+            loss_G_name, {"Avg. " + loss_G_name: G_avg_loss}, global_epoch
+        )
+        writer_loss.add_scalars(
+            loss_E_name, {"Avg. " + loss_E_name: E_avg_loss}, global_epoch
+        )
+
+        # Save models
+        save_dir = Path(save_dir)
+        save_dir.mkdir(exist_ok=True, parents=True)
+        torch.save(G.state_dict(), save_dir / "generator")
+        torch.save(C.state_dict(), save_dir / "discriminator")
+        torch.save(E.state_dict(), save_dir / "encoder")
+
+
 def _train_encoder_with_noise(
     latent_dim,  # =100
     num_filters,  # =[1024, 512, 256, 128]
@@ -358,7 +615,7 @@ def train_encoder_with_wae(
     num_filters,  # =[1024, 512, 256, 128]
     channels_img=3,
     learning_rate=2e-4,
-    batch_size=128,
+    n=128,
     image_size=64,
     num_epochs=100,
     reg_mmd=10,
@@ -389,7 +646,7 @@ def train_encoder_with_wae(
 
     data_loader = DataLoader(
         dataset,
-        batch_size=batch_size,
+        batch_size=n,
         shuffle=True,
         num_workers=NUM_WORKERS,
     )
@@ -442,12 +699,10 @@ def train_encoder_with_wae(
         # minibatch training
         for batch_idx, (real, _) in iterable:
             real = real.to(device)
-            batch_size = real.shape[0]
+            n = real.shape[0]
 
             # generate noise
-            z = G.sample_noise(
-                batch_size
-            )  # Generate {z_1, ..., z_n} from the prior P_z
+            z = G.sample_noise(n)  # Generate {z_1, ..., z_n} from the prior P_z
             z_tilde = E(real)  # Generate \tilde{z}_i from Q(Z|x_i) for i = 1:n
             x_recon = G(z_tilde)
 
@@ -742,23 +997,22 @@ def test_encoder(
 if __name__ == "__main__":
     IMAGE_SIZE = (size_x, size_y) = (64, 64)
     LATENT_DIM = 128
+    CRITERION = "mse"
     NUM_FILTERS = [256, 128, 64, 32]
     CHANNELS_IMG = 1
-    BATCH_SIZE = 256
-    NUM_EPOCHS = 150
+    BATCH_SIZE = 128
+    NUM_EPOCHS = 50
     REPORT_EVERY = 50
     FILE_PATH = "/home/fmunoz/codeProjects/pythonProjects/wgan-gp/dataset/quick_draw/face_recognized.npy"
     # FILE_PATH = "mnist"
-    NAME_DIR = (
-        f"face_zDim{LATENT_DIM}_{NOISE_NAME}_recognized_augmented_{size_x}p{size_y}"
-    )
+    NAME_DIR = f"face_zDim{LATENT_DIM}_{NOISE_NAME}_recognized_augmented_WAE_WGAN_loss_{CRITERION}_{size_x}p{size_y}"
     SAVE_DIR = Path("networks") / NAME_DIR
     SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
     TRANSFORM = T.Compose(
         [
             T.Resize(IMAGE_SIZE),
-            T.RandomHorizontalFlip(p=0.5),
-            T.RandomRotation(degrees=(-7, 7)),
+            T.RandomHorizontalFlip(p=0.25),
+            T.RandomRotation(degrees=(-3, 3)),
             T.ToTensor(),
             T.Normalize(
                 [0.5 for _ in range(CHANNELS_IMG)],
@@ -784,20 +1038,37 @@ if __name__ == "__main__":
     #     milestones=MILESTONES,
     # )
 
-    train_encoder_with_wae(
+    train_wgan_and_wae(
         latent_dim=LATENT_DIM,
         num_filters=NUM_FILTERS,
         channels_img=CHANNELS_IMG,
-        learning_rate=2e-4,
-        batch_size=BATCH_SIZE,
         image_size=IMAGE_SIZE,
+        learning_rate=3e-4,
+        batch_size=BATCH_SIZE,
         num_epochs=NUM_EPOCHS,
         file_path=FILE_PATH,
         save_dir=SAVE_DIR,
         summary_writer_dir=SUMMARY_WRITER_DIR,
         transform=TRANSFORM,
         report_every=REPORT_EVERY,
+        milestones=MILESTONES,
+        criterion=CRITERION,
     )
+
+    # train_encoder_with_wae(
+    #     latent_dim=LATENT_DIM,
+    #     num_filters=NUM_FILTERS,
+    #     channels_img=CHANNELS_IMG,
+    #     learning_rate=2e-4,
+    #     n=BATCH_SIZE,
+    #     image_size=IMAGE_SIZE,
+    #     num_epochs=NUM_EPOCHS,
+    #     file_path=FILE_PATH,
+    #     save_dir=SAVE_DIR,
+    #     summary_writer_dir=SUMMARY_WRITER_DIR,
+    #     transform=TRANSFORM,
+    #     report_every=REPORT_EVERY,
+    # )
 
     # finetune_encoder_with_samples(
     #     latent_dim=LATENT_DIM,
