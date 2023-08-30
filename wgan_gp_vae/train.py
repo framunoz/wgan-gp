@@ -318,12 +318,15 @@ def train_wgan_and_wae(
     step = 0
 
     # Schedulers
-    # G_scheduler = optim.lr_scheduler.MultiStepLR(
-    #     G_optimizer, milestones=milestones, gamma=0.75
-    # )
-    # C_scheduler = optim.lr_scheduler.MultiStepLR(
-    #     C_optimizer, milestones=milestones, gamma=0.75
-    # )
+    G_scheduler = optim.lr_scheduler.MultiStepLR(
+        G_optimizer, milestones=milestones, gamma=0.75
+    )
+    C_scheduler = optim.lr_scheduler.MultiStepLR(
+        C_optimizer, milestones=milestones, gamma=0.75
+    )
+    E_scheduler = optim.lr_scheduler.MultiStepLR(
+        E_optimizer, milestones=milestones, gamma=0.75
+    )
 
     C.train()
     G.train()
@@ -481,6 +484,11 @@ def train_wgan_and_wae(
         torch.save(G.state_dict(), save_dir / "generator")
         torch.save(C.state_dict(), save_dir / "discriminator")
         torch.save(E.state_dict(), save_dir / "encoder")
+
+        # Decrease learning-rate
+        G_scheduler.step()
+        C_scheduler.step()
+        E_scheduler.step()
 
 
 def _train_encoder_with_noise(
@@ -997,11 +1005,11 @@ def test_encoder(
 if __name__ == "__main__":
     IMAGE_SIZE = (size_x, size_y) = (64, 64)
     LATENT_DIM = 128
-    CRITERION = "mse"
+    CRITERION = "l1"
     NUM_FILTERS = [256, 128, 64, 32]
     CHANNELS_IMG = 1
     BATCH_SIZE = 128
-    NUM_EPOCHS = 50
+    NUM_EPOCHS = 150
     REPORT_EVERY = 50
     FILE_PATH = "/home/fmunoz/codeProjects/pythonProjects/wgan-gp/dataset/quick_draw/face_recognized.npy"
     # FILE_PATH = "mnist"
