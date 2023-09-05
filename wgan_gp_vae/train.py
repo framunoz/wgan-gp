@@ -12,7 +12,7 @@ import torchvision
 import torchvision.datasets as datasets
 import torchvision.models as models
 import torchvision.transforms as T
-from model import Critic, Encoder, Generator
+from model_resnet import Critic, Encoder, Generator
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -22,6 +22,7 @@ from utils import alexnet_norm, denorm, gradient_penalty, imq_kernel
 
 NUM_WORKERS = mp.cpu_count()
 NOISE_NAME = "gauss"
+type_models = "resnet"
 
 
 def sample_noise(n_dim, z_dim, device="cpu"):
@@ -274,9 +275,18 @@ def train_wgan_and_wae(
     )
 
     # Models
-    G = Generator(latent_dim, channels_img, num_filters).to(device)
-    C = Critic(channels_img, num_filters[::-1]).to(device)
-    E = Encoder(latent_dim, channels_img, num_filters[::-1]).to(device)
+    if num_filters:
+        G = Generator(latent_dim, channels_img, num_filters).to(device)
+        C = Critic(channels_img, num_filters[::-1]).to(device)
+        E = Encoder(latent_dim, channels_img, num_filters[::-1]).to(device)
+    else:
+        G = Generator(latent_dim, channels_img).to(device)
+        C = Critic(channels_img).to(device)
+        E = Encoder(latent_dim, channels_img).to(device)
+
+    print(E)
+    print(G)
+    print(C)
 
     # Loss function for WAE
     match criterion:
@@ -403,7 +413,7 @@ def train_wgan_and_wae(
             E_epoch_losses.append(E_loss.data.item())
 
             # Print losses occasionally and print to tensorboard
-            if batch_idx % report_every == 0 and batch_idx > 0:
+            if batch_idx % report_every == 0:
                 with torch.no_grad():
                     fake_WGAN = G(fixed_noise)
                     fake_WAE = G(E(real))
@@ -1003,23 +1013,24 @@ def test_encoder(
 
 
 if __name__ == "__main__":
-    IMAGE_SIZE = (size_x, size_y) = (64, 64)
+    IMAGE_SIZE = (size_x, size_y) = (32, 32)
     LATENT_DIM = 128
     CRITERION = "l1"
-    NUM_FILTERS = [256, 128, 64, 32]
+    # NUM_FILTERS = [256, 128, 64, 32]
+    NUM_FILTERS = None
     CHANNELS_IMG = 1
     BATCH_SIZE = 128
-    NUM_EPOCHS = 150
-    REPORT_EVERY = 50
+    NUM_EPOCHS = 50
+    REPORT_EVERY = 10
     FILE_PATH = "/home/fmunoz/codeProjects/pythonProjects/wgan-gp/dataset/quick_draw/face_recognized.npy"
     # FILE_PATH = "mnist"
-    NAME_DIR = f"face_zDim{LATENT_DIM}_{NOISE_NAME}_recognized_augmented_WAE_WGAN_loss_{CRITERION}_{size_x}p{size_y}"
+    NAME_DIR = f"resnet_face_zDim{LATENT_DIM}_{NOISE_NAME}_recognized_augmented_WAE_WGAN_loss_{CRITERION}_{size_x}p{size_y}"
     SAVE_DIR = Path("networks") / NAME_DIR
     SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
     TRANSFORM = T.Compose(
         [
             T.Resize(IMAGE_SIZE),
-            T.RandomHorizontalFlip(p=0.25),
+            T.RandomHorizontalFlip(p=0.5),
             T.RandomRotation(degrees=(-3, 3)),
             T.ToTensor(),
             T.Normalize(
