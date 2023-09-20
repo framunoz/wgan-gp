@@ -1,3 +1,7 @@
+from torchvision import disable_beta_transforms_warning
+
+disable_beta_transforms_warning()
+
 import multiprocessing as mp
 import os
 from pathlib import Path
@@ -5,14 +9,15 @@ from typing import Literal
 
 import dataloader
 import numpy as np
+import quick_torch as qt
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torchvision
 import torchvision.datasets as datasets
 import torchvision.models as models
-import torchvision.transforms as T
-from model_resnet import Critic, Encoder, Generator
+import torchvision.transforms.v2 as T
+from model_resnet import Critic, Encoder, Generator, ResidualBlock, ResidualBlockV2
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -41,11 +46,30 @@ def get_device(device=None) -> torch.device:
 
 def get_dataset(file_path: str, transform):
     dataset = None
+    test_dataset = None
 
     if file_path == "mnist":
         dataset = datasets.MNIST(root="dataset/", transform=transform, download=True)
     elif file_path == "celeba":
         dataset = datasets.ImageFolder(root="celeb_dataset", transform=transform)
+    elif file_path == "quickdraw":
+        categories = [qt.Category.FACE]
+        dataset = qt.QuickDraw(
+            root="dataset",
+            categories=categories,
+            train=True,
+            transform=transform,
+            download=True,
+            recognized=True,
+        )
+        test_dataset = qt.QuickDraw(
+            root="dataset",
+            categories=categories,
+            train=False,
+            transform=transform,
+            download=True,
+            recognized=True,
+        )
 
     file_path = Path(file_path)
     if dataset is not None:
@@ -57,7 +81,7 @@ def get_dataset(file_path: str, transform):
     else:
         raise FileNotFoundError("El archivo buscado no fue encontrado.")
 
-    return dataset
+    return dataset, test_dataset
 
 
 # Training methods
@@ -230,19 +254,24 @@ def train_gan(
 # Training methods
 def train_wgan_and_wae(
     latent_dim,  # =100
-    num_filters,  # =[1024, 512, 256, 128]
+    nn_kwargs=None,
     channels_img=3,
-    learning_rate=1e-4,
+    learning_rate_E=1e-3,
+    learning_rate_G=1e-4,
+    learning_rate_C=1e-4,
     batch_size=128,
     image_size=64,
     num_epochs=100,
     critic_iterations=5,
-    reg_gp=10,
-    reg_mmd=10,
+    penalty_wgan=10,
+    penalty_wae=10,
     criterion: Literal["mse", "l1"] = "l1",
-    betas=(0.0, 0.9),
+    betas_wgan=(0.5, 0.9),
+    betas_wae=(0.5, 0.999),
     weight_decay=1e-5,
     milestones=[25, 50, 75],
+    patience=10,  # Number of epochs to wait for improvement
+    min_delta=0,  # Minimum change in validation loss to be considered as an improvement
     device=None,
     transform=None,
     file_path: str | Literal["mnist", "celeba"] = "shoes_images/shoes.hdf5",
@@ -265,7 +294,7 @@ def train_wgan_and_wae(
     )
 
     # Dataset and Dataloader
-    dataset = get_dataset(file_path=file_path, transform=transform)
+    dataset, val_dataset = get_dataset(file_path=file_path, transform=transform)
 
     data_loader = DataLoader(
         dataset,
@@ -274,11 +303,19 @@ def train_wgan_and_wae(
         num_workers=NUM_WORKERS,
     )
 
+    if val_dataset:
+        val_data_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size * 2,
+            shuffle=False,
+            num_workers=NUM_WORKERS,
+        )
+
     # Models
-    if num_filters:
-        G = Generator(latent_dim, channels_img, num_filters).to(device)
-        C = Critic(channels_img, num_filters[::-1]).to(device)
-        E = Encoder(latent_dim, channels_img, num_filters[::-1]).to(device)
+    if nn_kwargs:
+        G = Generator(latent_dim, channels_img, **nn_kwargs["generator"]).to(device)
+        C = Critic(channels_img, **nn_kwargs["critic"]).to(device)
+        E = Encoder(latent_dim, channels_img, **nn_kwargs["encoder"]).to(device)
     else:
         G = Generator(latent_dim, channels_img).to(device)
         C = Critic(channels_img).to(device)
@@ -300,22 +337,22 @@ def train_wgan_and_wae(
     # Optimizers
     G_optimizer = optim.Adam(
         G.parameters(),
-        lr=learning_rate,
-        betas=betas,
+        lr=learning_rate_G,
+        betas=betas_wgan,
         weight_decay=weight_decay,
     )
     C_optimizer = optim.Adam(
         C.parameters(),
-        lr=learning_rate,
-        betas=betas,
+        lr=learning_rate_C,
+        betas=betas_wgan,
         weight_decay=weight_decay,
     )
     # Optimizer
     E_optimizer = optim.Adam(
         E.parameters(),
-        lr=learning_rate,
-        betas=betas,
-        weight_decay=1e-5,
+        lr=learning_rate_E,
+        betas=betas_wae,
+        weight_decay=weight_decay,
     )
 
     # for tensorboard plotting
@@ -326,6 +363,10 @@ def train_wgan_and_wae(
     writer_fake = SummaryWriter(summary_writer_dir / "fake")
     writer_loss = SummaryWriter(summary_writer_dir / "loss")
     step = 0
+
+    # Directory to save
+    save_dir = Path(save_dir)
+    save_dir.mkdir(exist_ok=True, parents=True)
 
     # Schedulers
     G_scheduler = optim.lr_scheduler.MultiStepLR(
@@ -342,6 +383,13 @@ def train_wgan_and_wae(
     G.train()
     E.train()
 
+    # Early stop
+    current_patience = 0
+    best_validation_loss = float("inf")
+
+    real_val, _ = next(iter(val_data_loader))
+    real_val = real_val.to(device)
+
     for epoch in range(num_epochs):
         epoch_wass_dist_WGAN = []
         epoch_wass_dist_WAE = []
@@ -351,11 +399,15 @@ def train_wgan_and_wae(
 
         if verbose:
             iterable = enumerate(
-                tqdm(data_loader, desc=f"Epoch [{epoch}/{num_epochs}]")
+                tqdm(
+                    data_loader,
+                    desc=f"Epoch [{epoch}/{num_epochs}], Patience {current_patience}",
+                )
             )
         else:
             iterable = enumerate(data_loader)
 
+        # Training loop
         for batch_idx, (real, _) in iterable:
             n = real.shape[0]
             real = real.to(device)
@@ -365,20 +417,18 @@ def train_wgan_and_wae(
             for _ in range(critic_iterations):
                 noise = G.sample_noise(n)
                 fake = G(noise)
-                critic_real = C(real).reshape(-1)
-                critic_fake = C(fake).reshape(-1)
-                gp = gradient_penalty(C, real, fake, device=device)
-                wasserstein_dist_WGAN = torch.mean(critic_real) - torch.mean(
-                    critic_fake
-                )
-                C_loss = -wasserstein_dist_WGAN + reg_gp * gp
+                c_real = C(real).reshape(-1)
+                c_fake = C(fake).reshape(-1)
+                gradient = gradient_penalty(C, real, fake, device=device)
+                wasserstein_dist_WGAN = torch.mean(c_real) - torch.mean(c_fake)
+                C_loss = -wasserstein_dist_WGAN + penalty_wgan * gradient
                 C.zero_grad()
                 C_loss.backward(retain_graph=True)
                 C_optimizer.step()
 
             # Train Generator: max E[critic(gen_fake)] <-> min -E[critic(gen_fake)]
-            gen_fake = C(fake).reshape(-1)
-            G_loss = -torch.mean(gen_fake)
+            c_fake = C(fake).reshape(-1)
+            G_loss = -torch.mean(c_fake)
             G.zero_grad()
             G_loss.backward()
             G_optimizer.step()
@@ -395,7 +445,7 @@ def train_wgan_and_wae(
             # Compute MMD
             mmd_loss = imq_kernel(z, z_tilde, p_distr=G.latent_distr)
 
-            E_loss = wasserstein_dist_WAE + reg_mmd * mmd_loss
+            E_loss = wasserstein_dist_WAE + penalty_wae * mmd_loss
 
             # Back propagation
             E.zero_grad()
@@ -417,9 +467,14 @@ def train_wgan_and_wae(
                 with torch.no_grad():
                     fake_WGAN = G(fixed_noise)
                     fake_WAE = G(E(real))
+                    fake_val_WAE = G(E(real_val))
+
                     # take out (up to) 32 examples
                     img_grid_real = torchvision.utils.make_grid(
                         real[:32], normalize=True
+                    )
+                    img_grid_real_val = torchvision.utils.make_grid(
+                        real_val[:32], normalize=True
                     )
                     img_grid_fake_WGAN = torchvision.utils.make_grid(
                         fake_WGAN[:32], normalize=True
@@ -427,18 +482,27 @@ def train_wgan_and_wae(
                     img_grid_fake_WAE = torchvision.utils.make_grid(
                         fake_WAE[:32], normalize=True
                     )
+                    img_grid_fake_val_WAE = torchvision.utils.make_grid(
+                        fake_val_WAE[:32], normalize=True
+                    )
 
                     loss_C_name = "Loss Discriminator"
                     loss_G_name = "Loss Generator"
                     loss_E_name = "Loss Encoder"
                     wass_dist_name_WGAN = "Wasserstein Distance WGAN"
                     wass_dist_name_WAE = "Wasserstein Distance WAE"
-                    writer_real.add_image("Real", img_grid_real, global_step=step)
+                    writer_real.add_image("1 Real", img_grid_real, global_step=step)
                     writer_fake.add_image(
-                        "Generated", img_grid_fake_WGAN, global_step=step
+                        "2 Decoded", img_grid_fake_WAE, global_step=step
+                    )
+                    writer_real.add_image(
+                        "3 Real Val", img_grid_real_val, global_step=step
                     )
                     writer_fake.add_image(
-                        "Decoded", img_grid_fake_WAE, global_step=step
+                        "4 Decoded Val", img_grid_fake_val_WAE, global_step=step
+                    )
+                    writer_fake.add_image(
+                        "5 Generated", img_grid_fake_WGAN, global_step=step
                     )
                     writer_loss.add_scalars(
                         loss_C_name, {loss_C_name: C_loss}, global_step=step
@@ -462,6 +526,35 @@ def train_wgan_and_wae(
 
                 step += 1
 
+        # Validation loop
+        if verbose:
+            iterable = tqdm(val_data_loader, desc=f"Val. Epoch [{epoch}/{num_epochs}]")
+        else:
+            iterable = val_data_loader
+
+        epoch_wass_dist_WAE_val = []
+        with torch.no_grad():
+            for real, _ in iterable:
+                real = real.to(device)
+                recon = G(E(real))
+                loss = criterion(real, recon)
+                epoch_wass_dist_WAE_val.append(loss.data.item())
+
+        # Calculate the average validation loss
+        avg_wass_dist_WAE_val = torch.mean(
+            torch.FloatTensor(epoch_wass_dist_WAE_val)
+        ).item()
+
+        if avg_wass_dist_WAE_val < best_validation_loss - min_delta:
+            best_validation_loss = avg_wass_dist_WAE_val
+            current_patience = 0
+            # Save models
+            torch.save(G.state_dict(), save_dir / "generator")
+            torch.save(C.state_dict(), save_dir / "discriminator")
+            torch.save(E.state_dict(), save_dir / "encoder")
+        else:
+            current_patience += 1
+
         global_epoch = step - 1
         avg_wass_dist_WGAN = torch.mean(torch.FloatTensor(epoch_wass_dist_WGAN)).item()
         avg_wass_dist_WAE = torch.mean(torch.FloatTensor(epoch_wass_dist_WAE)).item()
@@ -479,6 +572,11 @@ def train_wgan_and_wae(
             global_epoch,
         )
         writer_loss.add_scalars(
+            wass_dist_name_WAE,
+            {"Avg. " + wass_dist_name_WAE + " Validation": avg_wass_dist_WAE_val},
+            global_epoch,
+        )
+        writer_loss.add_scalars(
             loss_C_name, {"Avg. " + loss_C_name: C_avg_loss}, global_epoch
         )
         writer_loss.add_scalars(
@@ -488,12 +586,9 @@ def train_wgan_and_wae(
             loss_E_name, {"Avg. " + loss_E_name: E_avg_loss}, global_epoch
         )
 
-        # Save models
-        save_dir = Path(save_dir)
-        save_dir.mkdir(exist_ok=True, parents=True)
-        torch.save(G.state_dict(), save_dir / "generator")
-        torch.save(C.state_dict(), save_dir / "discriminator")
-        torch.save(E.state_dict(), save_dir / "encoder")
+        if current_patience >= patience:
+            print("Early stopping triggered. Training halted.")
+            break
 
         # Decrease learning-rate
         G_scheduler.step()
@@ -1013,33 +1108,32 @@ def test_encoder(
 
 
 if __name__ == "__main__":
+    msg = "Press enter to continue."
     IMAGE_SIZE = (size_x, size_y) = (32, 32)
-    LATENT_DIM = 128
     CRITERION = "l1"
-    # NUM_FILTERS = [256, 128, 64, 32]
-    NUM_FILTERS = None
     CHANNELS_IMG = 1
     BATCH_SIZE = 128
     NUM_EPOCHS = 50
     REPORT_EVERY = 10
-    FILE_PATH = "/home/fmunoz/codeProjects/pythonProjects/wgan-gp/dataset/quick_draw/face_recognized.npy"
-    # FILE_PATH = "mnist"
-    NAME_DIR = f"resnet_face_zDim{LATENT_DIM}_{NOISE_NAME}_recognized_augmented_WAE_WGAN_loss_{CRITERION}_{size_x}p{size_y}"
-    SAVE_DIR = Path("networks") / NAME_DIR
-    SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
+    # FILE_PATH = "/home/fmunoz/codeProjects/pythonProjects/wgan-gp/dataset/quick_draw/face_recognized.npy"
+    FILE_PATH = "quickdraw"
     TRANSFORM = T.Compose(
         [
-            T.Resize(IMAGE_SIZE),
             T.RandomHorizontalFlip(p=0.5),
-            T.RandomRotation(degrees=(-3, 3)),
-            T.ToTensor(),
+            T.RandomZoomOut(side_range=(1, 1.25)),
+            T.Resize(IMAGE_SIZE),
+            T.RandomRotation(
+                degrees=(-10, 10), interpolation=T.InterpolationMode.BILINEAR
+            ),
+            T.ToImageTensor(),
+            T.ConvertDtype(torch.float32),
             T.Normalize(
                 [0.5 for _ in range(CHANNELS_IMG)],
                 [0.5 for _ in range(CHANNELS_IMG)],
             ),
         ]
     )
-    MILESTONES = [50, 100]
+    MILESTONES = [25, 40]
 
     # train_gan(
     #     latent_dim=LATENT_DIM,
@@ -1057,12 +1151,116 @@ if __name__ == "__main__":
     #     milestones=MILESTONES,
     # )
 
+    LATENT_DIM = 64
+    NN_KWARGS = {
+        "encoder": dict(Block=ResidualBlockV2),
+        "generator": dict(Block=ResidualBlockV2),
+        "critic": dict(Block=ResidualBlockV2),
+    }
+    NAME_DIR = f"_resnetV2_face_zDim{LATENT_DIM}_{NOISE_NAME}_bs_{BATCH_SIZE}_recognized_augmented_WAE_WGAN_loss_{CRITERION}_{size_x}p{size_y}"
+    SAVE_DIR = Path("networks") / NAME_DIR
+    SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
     train_wgan_and_wae(
+        nn_kwargs=NN_KWARGS,
         latent_dim=LATENT_DIM,
-        num_filters=NUM_FILTERS,
         channels_img=CHANNELS_IMG,
         image_size=IMAGE_SIZE,
-        learning_rate=3e-4,
+        learning_rate_E=3e-4,
+        learning_rate_C=3e-4,
+        learning_rate_G=3e-4,
+        betas_wgan=(0.5, 0.9),
+        betas_wae=(0.5, 0.9),
+        batch_size=BATCH_SIZE,
+        num_epochs=NUM_EPOCHS,
+        file_path=FILE_PATH,
+        save_dir=SAVE_DIR,
+        summary_writer_dir=SUMMARY_WRITER_DIR,
+        transform=TRANSFORM,
+        report_every=REPORT_EVERY,
+        milestones=MILESTONES,
+        criterion=CRITERION,
+    )
+
+    LATENT_DIM = 128
+    NN_KWARGS = {
+        "encoder": dict(Block=ResidualBlock),
+        "generator": dict(Block=ResidualBlock),
+        "critic": dict(Block=ResidualBlock),
+    }
+    NAME_DIR = f"_resnet_face_zDim{LATENT_DIM}_{NOISE_NAME}_bs_{BATCH_SIZE}_recognized_augmented_WAE_WGAN_loss_{CRITERION}_{size_x}p{size_y}"
+    SAVE_DIR = Path("networks") / NAME_DIR
+    SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
+    train_wgan_and_wae(
+        nn_kwargs=NN_KWARGS,
+        latent_dim=LATENT_DIM,
+        channels_img=CHANNELS_IMG,
+        image_size=IMAGE_SIZE,
+        learning_rate_E=3e-4,
+        learning_rate_C=3e-4,
+        learning_rate_G=3e-4,
+        betas_wgan=(0.5, 0.9),
+        betas_wae=(0.5, 0.9),
+        batch_size=BATCH_SIZE,
+        num_epochs=NUM_EPOCHS,
+        file_path=FILE_PATH,
+        save_dir=SAVE_DIR,
+        summary_writer_dir=SUMMARY_WRITER_DIR,
+        transform=TRANSFORM,
+        report_every=REPORT_EVERY,
+        milestones=MILESTONES,
+        criterion=CRITERION,
+    )
+
+    LATENT_DIM = 128
+    NN_KWARGS = {
+        "encoder": dict(Block=ResidualBlockV2),
+        "generator": dict(Block=ResidualBlockV2),
+        "critic": dict(Block=ResidualBlockV2),
+    }
+    NAME_DIR = f"_resnetV2_face_zDim{LATENT_DIM}_{NOISE_NAME}_bs_{BATCH_SIZE}_recognized_augmented_WAE_WGAN_loss_{CRITERION}_{size_x}p{size_y}"
+    SAVE_DIR = Path("networks") / NAME_DIR
+    SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
+    train_wgan_and_wae(
+        nn_kwargs=NN_KWARGS,
+        latent_dim=LATENT_DIM,
+        channels_img=CHANNELS_IMG,
+        image_size=IMAGE_SIZE,
+        learning_rate_E=3e-4,
+        learning_rate_C=3e-4,
+        learning_rate_G=3e-4,
+        betas_wgan=(0.5, 0.9),
+        betas_wae=(0.5, 0.9),
+        batch_size=BATCH_SIZE,
+        num_epochs=NUM_EPOCHS,
+        file_path=FILE_PATH,
+        save_dir=SAVE_DIR,
+        summary_writer_dir=SUMMARY_WRITER_DIR,
+        transform=TRANSFORM,
+        report_every=REPORT_EVERY,
+        milestones=MILESTONES,
+        criterion=CRITERION,
+    )
+
+    input(msg)
+    LATENT_DIM = 64
+    NN_KWARGS = {
+        "encoder": dict(Block=ResidualBlock),
+        "generator": dict(Block=ResidualBlock),
+        "critic": dict(Block=ResidualBlock),
+    }
+    NAME_DIR = f"_resnet_face_zDim{LATENT_DIM}_{NOISE_NAME}_bs_{BATCH_SIZE}_recognized_augmented_WAE_WGAN_loss_{CRITERION}_{size_x}p{size_y}"
+    SAVE_DIR = Path("networks") / NAME_DIR
+    SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
+    train_wgan_and_wae(
+        nn_kwargs=NN_KWARGS,
+        latent_dim=LATENT_DIM,
+        channels_img=CHANNELS_IMG,
+        image_size=IMAGE_SIZE,
+        learning_rate_E=3e-4,
+        learning_rate_C=3e-4,
+        learning_rate_G=3e-4,
+        betas_wgan=(0.5, 0.9),
+        betas_wae=(0.5, 0.9),
         batch_size=BATCH_SIZE,
         num_epochs=NUM_EPOCHS,
         file_path=FILE_PATH,

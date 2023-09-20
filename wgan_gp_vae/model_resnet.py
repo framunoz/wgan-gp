@@ -99,6 +99,8 @@ def resample_factory(
 
 
 class ResidualBlock(nn.Module):
+    """Original Residual Block"""
+
     def __init__(
         self,
         in_channels: int,
@@ -115,49 +117,92 @@ class ResidualBlock(nn.Module):
         # Create norm layer
         self.norm_layer = norm_layer_factory(norm_layer)
 
-        # Create convolutional layers and resample
-        conv1, conv2, resample = resample_factory(resample, in_channels, out_channels)
-
-        shorcut = None
+        self.shortcut = None
         if in_channels != out_channels:
-            shorcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+            self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+        # Create convolutional layers and resample
+        conv1, conv2, self.resample = resample_factory(
+            resample, in_channels, out_channels
+        )
 
         # Modules
         self.act_func = act_func
+        self.norm1 = self.norm_layer(out_channels) if self.norm_layer else None
         self.conv1 = conv1
-        if self.norm_layer:
-            self.norm1 = self.norm_layer(out_channels)
+        self.norm2 = self.norm_layer(out_channels) if self.norm_layer else None
         self.conv2 = conv2
-        if self.norm_layer:
-            self.norm2 = self.norm_layer(out_channels)
-        self.shortcut = shorcut
-        self.resample = resample
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Compute identity
         identity = x  # (C_in, H_in, W_in)
         if self.shortcut:
-            identity = self.shortcut(
-                identity
-            )  # (C_in, H_in, W_in) -> (C_out, H_in, W_in)
+            # (C_in, H_in, W_in) -> (C_out, H_in, W_in)
+            identity = self.shortcut(identity)
         if self.resample:
-            identity = self.resample(
-                identity
-            )  # (C_out, H_in, W_in) -> (C_out, H_out, W_out)
+            # (C_out, H_in, W_in) -> (C_out, H_out, W_out)
+            identity = self.resample(identity)
 
-        out = self.conv1(x)
-        if self.norm_layer:
+        out = x
+
+        out = self.conv1(out)
+        if self.norm1:
             out = self.norm1(out)
         out = self.act_func(out)
 
         out = self.conv2(out)
-        if self.norm_layer:
+        if self.norm2:
             out = self.norm2(out)
 
         out += identity
         out = self.act_func(out)
 
         return out
+
+
+class ResidualBlockV2(ResidualBlock):
+    """Residual Block for ResNet v2 https://arxiv.org/pdf/1603.05027.pdf"""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        resample: _resample_t = None,
+        norm_layer: _norm_layer_t = "batch_norm",
+        act_func=nn.ReLU(),
+    ):
+        super().__init__(in_channels, out_channels, resample, norm_layer, act_func)
+
+        self.norm1 = self.norm_layer(in_channels) if self.norm_layer else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Compute identity
+        identity = x  # (C_in, H_in, W_in)
+        if self.shortcut:
+            # (C_in, H_in, W_in) -> (C_out, H_in, W_in)
+            identity = self.shortcut(identity)
+        if self.resample:
+            # (C_out, H_in, W_in) -> (C_out, H_out, W_out)
+            identity = self.resample(identity)
+
+        out = x
+
+        if self.norm1:
+            out = self.norm1(out)
+        out = self.act_func(out)
+        out = self.conv1(out)
+
+        if self.norm2:
+            out = self.norm2(out)
+        out = self.act_func(out)
+        out = self.conv2(out)
+
+        out += identity
+
+        return out
+
+
+_Block = ResidualBlock
 
 
 def _unif(n_dim, z_dim, device="cpu"):
@@ -182,30 +227,28 @@ class Generator(nn.Module):
         self,
         latent_dim,
         channels_img=3,
-        num_filters: Iterable[int] = (128, 128, 128, 128),
+        num_filters: Iterable[int] = (128, 128, 128, 128, 128),
         resample_list=("up", "up", "up", None),
+        Block=_Block,
     ) -> None:
         super().__init__()
         resample_list = (
-            ["up"] * len(num_filters) if resample_list is None else resample_list
+            ["up"] * (len(num_filters) - 1) if resample_list is None else resample_list
         )
-        if len(num_filters) != len(resample_list):
+        if len(num_filters) - 1 != len(resample_list):
             raise ValueError(
-                "Iterables 'num_filters' and 'resample_list' must have same length."
+                f"Iterables 'num_filters' and 'resample_list' must have same length. {len(num_filters)} - 1 != {len(resample_list)}"
             )
 
         self.latent_dim = latent_dim
 
         # Hidden Layers
         # (latent_dim, 1, 1) -> (latent_dim, 4, 4)
-        self.upsample = nn.ConvTranspose2d(latent_dim, latent_dim, 4)
-        num_filters = [latent_dim] + list(num_filters)
+        self.upsample = nn.ConvTranspose2d(latent_dim, num_filters[0], 4)
 
         self.res_layers = nn.Sequential()
         for i in range(len(num_filters) - 1):
-            res = ResidualBlock(
-                num_filters[i], num_filters[i + 1], resample=resample_list[i]
-            )
+            res = Block(num_filters[i], num_filters[i + 1], resample=resample_list[i])
             self.res_layers.add_module(f"res{i+1}", res)
 
         self.conv_out = nn.Conv2d(
@@ -234,6 +277,7 @@ class Critic(nn.Module):
         channels_img=3,
         num_filters: Iterable[int] = (128, 128, 128, 128),
         resample_list=("down", "down", None, None),
+        Block=_Block,
     ):
         super().__init__()
         if len(num_filters) != len(resample_list):
@@ -246,7 +290,7 @@ class Critic(nn.Module):
         self.res_layers = nn.Sequential()
         for i in range(len(num_filters) - 1):
             norm_layer = "instance_norm" if i > 0 else None
-            res = ResidualBlock(
+            res = Block(
                 num_filters[i],
                 num_filters[i + 1],
                 resample=resample_list[i],
@@ -276,6 +320,7 @@ class Encoder(nn.Module):
         channels_img=3,
         num_filters: Iterable[int] = (128, 128, 128, 128),
         resample_list=("down", "down", "down", None),
+        Block=_Block,
     ):
         super().__init__()
         if len(num_filters) != len(resample_list):
@@ -288,7 +333,7 @@ class Encoder(nn.Module):
         self.res_layers = nn.Sequential()
         for i in range(len(num_filters) - 1):
             norm_layer = "batch_norm" if i > 0 else None
-            res = ResidualBlock(
+            res = Block(
                 num_filters[i],
                 num_filters[i + 1],
                 resample=resample_list[i],
@@ -369,13 +414,14 @@ def _test():
     assert rb(x).shape == (N, out_channels, H, W), "ResidualBlock test failed"
 
     # Generator test
-    gen = Generator(latent_dim, in_channels, [128, 64, 32, 16]).to(dev)
+    gen = Generator(latent_dim, in_channels, [128, 64, 32, 16, 8]).to(dev)
     assert gen(z).shape == (N, in_channels, H, W), "Generator test failed"
+    print(gen)
 
     # Critic test
     critic = Critic(in_channels, [8, 16, 32, 64]).to(dev)
-
     assert critic(x).shape == (N, 1, 1, 1), "Critic test failed"
+    print(critic)
 
     # Encoder
     enc = Encoder(latent_dim, in_channels, [16, 32, 64, 128]).to(dev)
