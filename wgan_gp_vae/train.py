@@ -263,14 +263,14 @@ def train_wgan_and_wae(
     image_size=64,
     num_epochs=100,
     critic_iterations=5,
-    penalty_wgan=10,
+    penalty_wgan=20,
     penalty_wae=10,
     criterion: Literal["mse", "l1"] = "l1",
     betas_wgan=(0.5, 0.9),
     betas_wae=(0.5, 0.999),
     weight_decay=1e-5,
     milestones=[25, 50, 75],
-    patience=10,  # Number of epochs to wait for improvement
+    patience=5,  # Number of epochs to wait for improvement
     min_delta=0,  # Minimum change in validation loss to be considered as an improvement
     device=None,
     transform=None,
@@ -370,13 +370,13 @@ def train_wgan_and_wae(
 
     # Schedulers
     G_scheduler = optim.lr_scheduler.MultiStepLR(
-        G_optimizer, milestones=milestones, gamma=0.75
+        G_optimizer, milestones=milestones, gamma=0.5
     )
     C_scheduler = optim.lr_scheduler.MultiStepLR(
-        C_optimizer, milestones=milestones, gamma=0.75
+        C_optimizer, milestones=milestones, gamma=0.5
     )
     E_scheduler = optim.lr_scheduler.MultiStepLR(
-        E_optimizer, milestones=milestones, gamma=0.75
+        E_optimizer, milestones=milestones, gamma=0.5
     )
 
     C.train()
@@ -396,6 +396,9 @@ def train_wgan_and_wae(
         C_epoch_losses = []
         G_epoch_losses = []
         E_epoch_losses = []
+        critic_real_values = []
+        critic_fake_values = []
+        gradient_norm_values = []
 
         if verbose:
             iterable = enumerate(
@@ -419,7 +422,7 @@ def train_wgan_and_wae(
                 fake = G(noise)
                 c_real = C(real).reshape(-1)
                 c_fake = C(fake).reshape(-1)
-                gradient = gradient_penalty(C, real, fake, device=device)
+                gradient, gradient_norm = gradient_penalty(C, real, fake, device=device)
                 wasserstein_dist_WGAN = torch.mean(c_real) - torch.mean(c_fake)
                 C_loss = -wasserstein_dist_WGAN + penalty_wgan * gradient
                 C.zero_grad()
@@ -461,6 +464,12 @@ def train_wgan_and_wae(
             C_epoch_losses.append(C_loss.data.item())
             G_epoch_losses.append(G_loss.data.item())
             E_epoch_losses.append(E_loss.data.item())
+            critic_real_value = torch.mean(c_real)
+            critic_fake_value = torch.mean(c_fake)
+            critic_real_values.append(critic_real_value.data.item())
+            critic_fake_values.append(critic_fake_value.data.item())
+            gradient_norm_mean = torch.mean(gradient_norm)
+            gradient_norm_values.append(gradient_norm_mean.data.item())
 
             # Print losses occasionally and print to tensorboard
             if batch_idx % report_every == 0:
@@ -489,8 +498,10 @@ def train_wgan_and_wae(
                     loss_C_name = "Loss Discriminator"
                     loss_G_name = "Loss Generator"
                     loss_E_name = "Loss Encoder"
+                    critic_values_name = "Critic Values"
                     wass_dist_name_WGAN = "Wasserstein Distance WGAN"
                     wass_dist_name_WAE = "Wasserstein Distance WAE"
+                    gradient_norm_name = "Gradient Norm"
                     writer_real.add_image("1 Real", img_grid_real, global_step=step)
                     writer_fake.add_image(
                         "2 Decoded", img_grid_fake_WAE, global_step=step
@@ -523,6 +534,19 @@ def train_wgan_and_wae(
                         {wass_dist_name_WAE: wasserstein_dist_WAE},
                         global_step=step,
                     )
+                    writer_loss.add_scalars(
+                        gradient_norm_name,
+                        {gradient_norm_name: gradient_norm_mean},
+                        global_step=step,
+                    )
+                    writer_loss.add_scalars(
+                        critic_values_name,
+                        {
+                            "Real": critic_real_value,
+                            "Fake": critic_fake_value,
+                        },
+                        global_step=step,
+                    )
 
                 step += 1
 
@@ -533,16 +557,30 @@ def train_wgan_and_wae(
             iterable = val_data_loader
 
         epoch_wass_dist_WAE_val = []
+        epoch_wass_dist_WGAN_val = []
         with torch.no_grad():
             for real, _ in iterable:
                 real = real.to(device)
+                n = real.shape[0]
+
+                # WAE Validation Loss
                 recon = G(E(real))
                 loss = criterion(real, recon)
                 epoch_wass_dist_WAE_val.append(loss.data.item())
 
+                # WGAN Validation Loss
+                noise = G.sample_noise(n)
+                fake = G(noise)
+                c_real, c_fake = C(real).reshape(-1), C(fake).reshape(-1)
+                loss = torch.mean(c_real) - torch.mean(c_fake)
+                epoch_wass_dist_WGAN_val.append(loss.data.item())
+
         # Calculate the average validation loss
         avg_wass_dist_WAE_val = torch.mean(
             torch.FloatTensor(epoch_wass_dist_WAE_val)
+        ).item()
+        avg_wass_dist_WGAN_val = torch.mean(
+            torch.FloatTensor(epoch_wass_dist_WGAN_val)
         ).item()
 
         if avg_wass_dist_WAE_val < best_validation_loss - min_delta:
@@ -561,6 +599,11 @@ def train_wgan_and_wae(
         C_avg_loss = torch.mean(torch.FloatTensor(C_epoch_losses)).item()
         G_avg_loss = torch.mean(torch.FloatTensor(G_epoch_losses)).item()
         E_avg_loss = torch.mean(torch.FloatTensor(E_epoch_losses)).item()
+        critic_real_avg_loss = torch.mean(torch.FloatTensor(critic_real_values)).item()
+        critic_fake_avg_loss = torch.mean(torch.FloatTensor(critic_fake_values)).item()
+        gradient_norm_values_avg = torch.mean(
+            torch.FloatTensor(gradient_norm_values)
+        ).item()
         writer_loss.add_scalars(
             wass_dist_name_WGAN,
             {"Avg. " + wass_dist_name_WGAN: avg_wass_dist_WGAN},
@@ -572,8 +615,8 @@ def train_wgan_and_wae(
             global_epoch,
         )
         writer_loss.add_scalars(
-            wass_dist_name_WAE,
-            {"Avg. " + wass_dist_name_WAE + " Validation": avg_wass_dist_WAE_val},
+            gradient_norm_name,
+            {"Avg. " + gradient_norm_name: gradient_norm_values_avg},
             global_epoch,
         )
         writer_loss.add_scalars(
@@ -584,6 +627,21 @@ def train_wgan_and_wae(
         )
         writer_loss.add_scalars(
             loss_E_name, {"Avg. " + loss_E_name: E_avg_loss}, global_epoch
+        )
+        writer_loss.add_scalars(
+            critic_values_name,
+            {"Avg. Real": critic_real_avg_loss, "Avg. Fake": critic_fake_avg_loss},
+            global_epoch,
+        )
+        writer_loss.add_scalars(
+            wass_dist_name_WAE,
+            {"Avg. " + wass_dist_name_WAE + " Validation": avg_wass_dist_WAE_val},
+            global_epoch,
+        )
+        writer_loss.add_scalars(
+            wass_dist_name_WGAN,
+            {"Avg. " + wass_dist_name_WGAN + " Validation": avg_wass_dist_WGAN_val},
+            global_epoch,
         )
 
         if current_patience >= patience:
@@ -1113,7 +1171,7 @@ if __name__ == "__main__":
     CRITERION = "l1"
     CHANNELS_IMG = 1
     BATCH_SIZE = 128
-    NUM_EPOCHS = 50
+    NUM_EPOCHS = 100
     REPORT_EVERY = 10
     # FILE_PATH = "/home/fmunoz/codeProjects/pythonProjects/wgan-gp/dataset/quick_draw/face_recognized.npy"
     FILE_PATH = "quickdraw"
@@ -1133,55 +1191,9 @@ if __name__ == "__main__":
             ),
         ]
     )
-    MILESTONES = [25, 40]
-
-    # train_gan(
-    #     latent_dim=LATENT_DIM,
-    #     num_filters=NUM_FILTERS,
-    #     channels_img=CHANNELS_IMG,
-    #     image_size=IMAGE_SIZE,
-    #     learning_rate=3e-4,
-    #     batch_size=BATCH_SIZE,
-    #     num_epochs=NUM_EPOCHS,
-    #     file_path=FILE_PATH,
-    #     save_dir=SAVE_DIR,
-    #     summary_writer_dir=SUMMARY_WRITER_DIR,
-    #     transform=TRANSFORM,
-    #     report_every=REPORT_EVERY,
-    #     milestones=MILESTONES,
-    # )
+    MILESTONES = [15, 30, 45, 60, 75, 90]
 
     LATENT_DIM = 64
-    NN_KWARGS = {
-        "encoder": dict(Block=ResidualBlockV2),
-        "generator": dict(Block=ResidualBlockV2),
-        "critic": dict(Block=ResidualBlockV2),
-    }
-    NAME_DIR = f"_resnetV2_face_zDim{LATENT_DIM}_{NOISE_NAME}_bs_{BATCH_SIZE}_recognized_augmented_WAE_WGAN_loss_{CRITERION}_{size_x}p{size_y}"
-    SAVE_DIR = Path("networks") / NAME_DIR
-    SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
-    train_wgan_and_wae(
-        nn_kwargs=NN_KWARGS,
-        latent_dim=LATENT_DIM,
-        channels_img=CHANNELS_IMG,
-        image_size=IMAGE_SIZE,
-        learning_rate_E=3e-4,
-        learning_rate_C=3e-4,
-        learning_rate_G=3e-4,
-        betas_wgan=(0.5, 0.9),
-        betas_wae=(0.5, 0.9),
-        batch_size=BATCH_SIZE,
-        num_epochs=NUM_EPOCHS,
-        file_path=FILE_PATH,
-        save_dir=SAVE_DIR,
-        summary_writer_dir=SUMMARY_WRITER_DIR,
-        transform=TRANSFORM,
-        report_every=REPORT_EVERY,
-        milestones=MILESTONES,
-        criterion=CRITERION,
-    )
-
-    LATENT_DIM = 128
     NN_KWARGS = {
         "encoder": dict(Block=ResidualBlock),
         "generator": dict(Block=ResidualBlock),
@@ -1213,11 +1225,11 @@ if __name__ == "__main__":
 
     LATENT_DIM = 128
     NN_KWARGS = {
-        "encoder": dict(Block=ResidualBlockV2),
-        "generator": dict(Block=ResidualBlockV2),
-        "critic": dict(Block=ResidualBlockV2),
+        "encoder": dict(Block=ResidualBlock),
+        "generator": dict(Block=ResidualBlock),
+        "critic": dict(Block=ResidualBlock),
     }
-    NAME_DIR = f"_resnetV2_face_zDim{LATENT_DIM}_{NOISE_NAME}_bs_{BATCH_SIZE}_recognized_augmented_WAE_WGAN_loss_{CRITERION}_{size_x}p{size_y}"
+    NAME_DIR = f"_resnet_face_zDim{LATENT_DIM}_{NOISE_NAME}_bs_{BATCH_SIZE}_recognized_augmented_WAE_WGAN_loss_{CRITERION}_{size_x}p{size_y}"
     SAVE_DIR = Path("networks") / NAME_DIR
     SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
     train_wgan_and_wae(
@@ -1244,11 +1256,11 @@ if __name__ == "__main__":
     input(msg)
     LATENT_DIM = 64
     NN_KWARGS = {
-        "encoder": dict(Block=ResidualBlock),
-        "generator": dict(Block=ResidualBlock),
-        "critic": dict(Block=ResidualBlock),
+        "encoder": dict(Block=ResidualBlockV2),
+        "generator": dict(Block=ResidualBlockV2),
+        "critic": dict(Block=ResidualBlockV2),
     }
-    NAME_DIR = f"_resnet_face_zDim{LATENT_DIM}_{NOISE_NAME}_bs_{BATCH_SIZE}_recognized_augmented_WAE_WGAN_loss_{CRITERION}_{size_x}p{size_y}"
+    NAME_DIR = f"_resnetV2_face_zDim{LATENT_DIM}_{NOISE_NAME}_bs_{BATCH_SIZE}_recognized_augmented_WAE_WGAN_loss_{CRITERION}_{size_x}p{size_y}"
     SAVE_DIR = Path("networks") / NAME_DIR
     SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
     train_wgan_and_wae(
@@ -1271,6 +1283,52 @@ if __name__ == "__main__":
         milestones=MILESTONES,
         criterion=CRITERION,
     )
+
+    LATENT_DIM = 128
+    NN_KWARGS = {
+        "encoder": dict(Block=ResidualBlockV2),
+        "generator": dict(Block=ResidualBlockV2),
+        "critic": dict(Block=ResidualBlockV2),
+    }
+    NAME_DIR = f"_resnetV2_face_zDim{LATENT_DIM}_{NOISE_NAME}_bs_{BATCH_SIZE}_recognized_augmented_WAE_WGAN_loss_{CRITERION}_{size_x}p{size_y}"
+    SAVE_DIR = Path("networks") / NAME_DIR
+    SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
+    train_wgan_and_wae(
+        nn_kwargs=NN_KWARGS,
+        latent_dim=LATENT_DIM,
+        channels_img=CHANNELS_IMG,
+        image_size=IMAGE_SIZE,
+        learning_rate_E=3e-4,
+        learning_rate_C=3e-4,
+        learning_rate_G=3e-4,
+        betas_wgan=(0.5, 0.9),
+        betas_wae=(0.5, 0.9),
+        batch_size=BATCH_SIZE,
+        num_epochs=NUM_EPOCHS,
+        file_path=FILE_PATH,
+        save_dir=SAVE_DIR,
+        summary_writer_dir=SUMMARY_WRITER_DIR,
+        transform=TRANSFORM,
+        report_every=REPORT_EVERY,
+        milestones=MILESTONES,
+        criterion=CRITERION,
+    )
+
+    # train_gan(
+    #     latent_dim=LATENT_DIM,
+    #     num_filters=NUM_FILTERS,
+    #     channels_img=CHANNELS_IMG,
+    #     image_size=IMAGE_SIZE,
+    #     learning_rate=3e-4,
+    #     batch_size=BATCH_SIZE,
+    #     num_epochs=NUM_EPOCHS,
+    #     file_path=FILE_PATH,
+    #     save_dir=SAVE_DIR,
+    #     summary_writer_dir=SUMMARY_WRITER_DIR,
+    #     transform=TRANSFORM,
+    #     report_every=REPORT_EVERY,
+    #     milestones=MILESTONES,
+    # )
 
     # train_encoder_with_wae(
     #     latent_dim=LATENT_DIM,

@@ -1,3 +1,4 @@
+import abc
 import functools
 from typing import Callable, Iterable, Literal, Optional, Type
 
@@ -7,6 +8,7 @@ import torch.nn.functional as F
 from torch.nn.common_types import _size_2_t
 
 _norm_layer_t = Optional[Literal["instance_norm", "batch_norm"]]
+_device_t = str | torch.device
 _resample_t = Optional[Literal["up", "down"]]
 
 
@@ -205,11 +207,11 @@ class ResidualBlockV2(ResidualBlock):
 _Block = ResidualBlock
 
 
-def _unif(n_dim, z_dim, device="cpu"):
+def _unif(n_dim: int, z_dim: int, device: _device_t = "cpu"):
     return 2 * torch.rand(n_dim, z_dim, 1, 1).to(device) - 1
 
 
-def _norm(n_dim, z_dim, device="cpu"):
+def _norm(n_dim: int, z_dim: int, device: _device_t = "cpu"):
     return torch.randn(n_dim, z_dim, 1, 1).to(device)
 
 
@@ -225,10 +227,10 @@ class Generator(nn.Module):
 
     def __init__(
         self,
-        latent_dim,
-        channels_img=3,
+        latent_dim: int,
+        channels_img: int = 3,
         num_filters: Iterable[int] = (128, 128, 128, 128, 128),
-        resample_list=("up", "up", "up", None),
+        resample_list: Iterable[Optional[str]] = ("up", "up", "up", None),
         Block=_Block,
     ) -> None:
         super().__init__()
@@ -353,7 +355,7 @@ class Encoder(nn.Module):
         )
         self.output_layer.add_module("out", out)
 
-        # Activation
+        # Normalization
         batch_norm = nn.BatchNorm2d(latent_dim)
         self.output_layer.add_module("bn_out", batch_norm)
 
