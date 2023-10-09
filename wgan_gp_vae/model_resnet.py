@@ -1,8 +1,10 @@
 import abc
 import functools
+import math
 from typing import Callable, Iterable, Literal, Optional, Type
 
 import torch
+import torch.distributions as D
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.common_types import _size_2_t
@@ -207,23 +209,74 @@ class ResidualBlockV2(ResidualBlock):
 _Block = ResidualBlock
 
 
-def _unif(n_dim: int, z_dim: int, device: _device_t = "cpu"):
-    return 2 * torch.rand(n_dim, z_dim, 1, 1).to(device) - 1
+class latent_distr(abc.ABC):
+    @abc.abstractmethod
+    def __call__(self, n_dim: int, device: _device_t = "cpu"):
+        """Return a tensor of shape (n_dim, z_dim, 1, 1)"""
+        pass
+
+    @abc.abstractmethod
+    def log_prob(self, z: torch.Tensor, device: _device_t = "cpu") -> torch.Tensor:
+        """Return the log probability of z."""
+        raise NotImplementedError
+
+    @property
+    def name(self):
+        return self.__class__.__name__
 
 
-def _norm(n_dim: int, z_dim: int, device: _device_t = "cpu"):
-    return torch.randn(n_dim, z_dim, 1, 1).to(device)
+class unif(latent_distr):
+    def __init__(
+        self, z_dim: int = 100, device: _device_t = "cpu", a: float = -1, b: float = 1
+    ):
+        self.z_dim = z_dim
+        self.a = torch.tensor(float(a), device=device)
+        self.b = torch.tensor(float(b), device=device)
+        self.distr = D.Uniform(self.a, self.b)
+
+    def __call__(self, n_dim: int):
+        return self.distr.sample((n_dim, self.z_dim, 1, 1))
+
+    def log_prob(self, z: torch.Tensor) -> torch.Tensor:
+        restrict = ((z >= self.a) & (z <= self.b)).bool()
+        restrict = torch.all(restrict, dim=1)
+        return torch.where(
+            restrict,
+            0,
+            torch.finfo(z.dtype).min,
+        ).unsqueeze(1)
+
+
+class norm(latent_distr):
+    def __init__(
+        self,
+        z_dim: int = 100,
+        device: _device_t = "cpu",
+        loc: float = 0,
+        scale: float = 1,
+    ):
+        self.z_dim = z_dim
+        self.loc = torch.tensor(float(loc), device=device)
+        self.scale = torch.tensor(float(scale), device=device)
+        self.distr = D.Normal(self.loc, self.scale)
+
+    def __call__(self, n_dim: int):
+        return self.distr.sample((n_dim, self.z_dim, 1, 1))
+
+    def log_prob(self, z: torch.Tensor) -> torch.Tensor:
+        norm_z_2 = torch.sum(z**2, dim=1)
+        return -0.5 * norm_z_2.unsqueeze(1)
 
 
 _LATENT_DISTR = {
-    "unif": _unif,
-    "norm": _norm,
+    "unif": unif,
+    "norm": norm,
 }
 
 
 # Generator model
 class Generator(nn.Module):
-    latent_distr: Literal["unif", "norm"] = "norm"
+    latent_distr_name: Literal["unif", "norm"] = "norm"
 
     def __init__(
         self,
@@ -232,6 +285,7 @@ class Generator(nn.Module):
         num_filters: Iterable[int] = (128, 128, 128, 128, 128),
         resample_list: Iterable[Optional[str]] = ("up", "up", "up", None),
         Block=_Block,
+        latent_distr: str | latent_distr = "norm",
     ) -> None:
         super().__init__()
         resample_list = (
@@ -256,10 +310,19 @@ class Generator(nn.Module):
         self.conv_out = nn.Conv2d(
             num_filters[-1], channels_img, kernel_size=3, padding=1
         )
+        self._latent_distr = latent_distr
 
     @property
     def device(self) -> torch.device:
         return next(self.parameters()).device
+
+    @property
+    def latent_distr(self) -> latent_distr:
+        if isinstance(self._latent_distr, str):
+            self._latent_distr = _LATENT_DISTR[self._latent_distr](
+                z_dim=self.latent_dim, device=self.device
+            )
+        return self._latent_distr
 
     def forward(self, x):
         x = self.upsample(x)
@@ -269,7 +332,7 @@ class Generator(nn.Module):
         return x
 
     def sample_noise(self, n: int) -> torch.Tensor:
-        return _LATENT_DISTR[self.latent_distr](n, self.latent_dim, self.device)
+        return self.latent_distr(n)
 
 
 # critic model
@@ -416,7 +479,9 @@ def _test():
     assert rb(x).shape == (N, out_channels, H, W), "ResidualBlock test failed"
 
     # Generator test
-    gen = Generator(latent_dim, in_channels, [128, 64, 32, 16, 8]).to(dev)
+    gen = Generator(
+        latent_dim, in_channels, [128, 64, 32, 16, 8], latent_distr="norm"
+    ).to(dev)
     assert gen(z).shape == (N, in_channels, H, W), "Generator test failed"
     print(gen)
 
@@ -429,6 +494,17 @@ def _test():
     enc = Encoder(latent_dim, in_channels, [16, 32, 64, 128]).to(dev)
     assert enc(x).shape == (N, latent_dim, 1, 1), "Encoder test failed"
     print(enc)
+
+    z_ = gen.sample_noise(N)
+    # print(z_.device)
+    # print(gen.latent_distr.log_prob(z_).shape)
+    z_ = gen.sample_noise(N)
+    # z_ = torch.ones_like(z_) * 2
+    # z_[0, 0, 0, 0] = 2
+    print(z_.shape)
+    print(gen.latent_distr.log_prob(z_))
+    print(gen.latent_distr.log_prob(z_).shape)
+    print(gen.latent_distr.name)
 
     print("Tests passed")
 

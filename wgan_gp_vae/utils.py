@@ -4,13 +4,14 @@ from typing import Any, Literal
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.transforms as transforms
 
 _models_option = "encoder", "generator"
 TypeModels = Literal["encoder", "generator"]
 
 
-def gradient_penalty(critic, real, fake, device="cpu"):
+def gradient_penalty(critic, real, fake, device="cpu", penalty_gr=10):
     device = torch.device(device)
     BATCH_SIZE, C, H, W = real.shape
     alpha = torch.rand((BATCH_SIZE, 1, 1, 1)).repeat(1, C, H, W).to(device)
@@ -29,9 +30,7 @@ def gradient_penalty(critic, real, fake, device="cpu"):
     )[0]
     gradient = gradient.view(gradient.shape[0], -1)
     gradient_norm = gradient.norm(2, dim=1)
-    gradient_penalty = torch.mean(
-        torch.maximum((gradient_norm - 1), torch.zeros_like(gradient_norm)) ** 2
-    )
+    gradient_penalty = torch.mean(F.leaky_relu(gradient_norm - 1, penalty_gr) ** 2)
     return gradient_penalty, gradient_norm
 
 
