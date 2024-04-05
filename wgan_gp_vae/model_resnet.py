@@ -140,22 +140,22 @@ class ResidualBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Compute identity
         identity = x  # (C_in, H_in, W_in)
-        if self.shortcut:
+        if self.shortcut is not None:
             # (C_in, H_in, W_in) -> (C_out, H_in, W_in)
             identity = self.shortcut(identity)
-        if self.resample:
+        if self.resample is not None:
             # (C_out, H_in, W_in) -> (C_out, H_out, W_out)
             identity = self.resample(identity)
 
         out = x
 
         out = self.conv1(out)
-        if self.norm1:
+        if self.norm1 is not None:
             out = self.norm1(out)
         out = self.act_func(out)
 
         out = self.conv2(out)
-        if self.norm2:
+        if self.norm2 is not None:
             out = self.norm2(out)
 
         out += identity
@@ -182,21 +182,21 @@ class ResidualBlockV2(ResidualBlock):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Compute identity
         identity = x  # (C_in, H_in, W_in)
-        if self.shortcut:
+        if self.shortcut is not None:
             # (C_in, H_in, W_in) -> (C_out, H_in, W_in)
             identity = self.shortcut(identity)
-        if self.resample:
+        if self.resample is not None:
             # (C_out, H_in, W_in) -> (C_out, H_out, W_out)
             identity = self.resample(identity)
 
         out = x
 
-        if self.norm1:
+        if self.norm1 is not None:
             out = self.norm1(out)
         out = self.act_func(out)
         out = self.conv1(out)
 
-        if self.norm2:
+        if self.norm2 is not None:
             out = self.norm2(out)
         out = self.act_func(out)
         out = self.conv2(out)
@@ -310,19 +310,19 @@ class Generator(nn.Module):
         self.conv_out = nn.Conv2d(
             num_filters[-1], channels_img, kernel_size=3, padding=1
         )
-        self._latent_distr = latent_distr
+        self._latent_distr = _LATENT_DISTR[latent_distr]
 
-    @property
-    def device(self) -> torch.device:
-        return next(self.parameters()).device
+    # @property
+    # def device(self) -> torch.device:
+    #     return next(self.parameters()).device
 
-    @property
-    def latent_distr(self) -> latent_distr:
-        if isinstance(self._latent_distr, str):
-            self._latent_distr = _LATENT_DISTR[self._latent_distr](
-                z_dim=self.latent_dim, device=self.device
-            )
-        return self._latent_distr
+    # @property
+    # def latent_distr(self) -> latent_distr:
+    #     if isinstance(self._latent_distr, str):
+    #         self._latent_distr = _LATENT_DISTR[self._latent_distr](
+    #             z_dim=self.latent_dim, device=self.device
+    #         )
+    #     return self._latent_distr
 
     def forward(self, x):
         x = self.upsample(x)
@@ -331,8 +331,11 @@ class Generator(nn.Module):
         x = F.tanh(x)
         return x
 
-    def sample_noise(self, n: int) -> torch.Tensor:
-        return self.latent_distr(n)
+    def sample_noise(self, n: int, type_as=None) -> torch.Tensor:
+        if type_as is None:
+            return self._latent_distr(z_dim=self.latent_dim)(n)
+        else:
+            return self._latent_distr(z_dim=self.latent_dim, device=type_as.device)(n)
 
 
 # critic model
