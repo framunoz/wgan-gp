@@ -1,10 +1,10 @@
 import math
 
+from matplotlib.pyplot import isinteractive
 from torchvision import disable_beta_transforms_warning
 
 disable_beta_transforms_warning()
 
-import multiprocessing as mp
 import os
 from pathlib import Path
 from typing import Literal
@@ -19,6 +19,7 @@ import torchvision
 import torchvision.datasets as datasets
 import torchvision.models as models
 import torchvision.transforms.v2 as T
+import utils
 from model_resnet import Critic, Encoder, Generator, ResidualBlock
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
@@ -27,10 +28,58 @@ from torchvision.utils import save_image
 from tqdm import tqdm
 from utils import alexnet_norm, denorm, gradient_penalty, imq_kernel
 
-NUM_WORKERS = mp.cpu_count() // 2
+NUM_WORKERS = 10
 print(f"Using {NUM_WORKERS} workers.")
-NOISE_NAME = "unif"
+NOISE_NAME = "norm"
 type_models = "resnet"
+
+torch.backends.cudnn.benchmark = True
+
+
+class CriticIterations:
+    def __init__(self, critic_iterations, patience=2):
+        self.k = 0
+        self.last_loss = -float("inf")
+        self.new_loss = -float("inf")
+        self.patience = patience
+
+        if callable(critic_iterations):
+            try:
+                _critic_iterations = critic_iterations
+                critic_iterations(19, 1.0)
+            except TypeError:
+
+                def _critic_iterations(epoch, *args, **kwargs):
+                    return critic_iterations(epoch)
+
+            self.critic_iterations = _critic_iterations
+        else:
+            self.critic_iterations = critic_iterations
+
+    def register_new_loss(self, new_loss):
+        self.last_loss = self.new_loss
+        self.new_loss = new_loss
+
+        if callable(self.critic_iterations):
+            return
+
+        if self.new_loss < self.last_loss:
+            self.k += 1
+        else:
+            self.k = 0
+
+        if self.k >= self.patience:
+            self.critic_iterations = max(2, self.critic_iterations - 1)
+            self.k = 0
+
+    def __call__(self, epoch):
+        if callable(self.critic_iterations):
+            return self.critic_iterations(epoch, self.new_loss)
+
+        return self.critic_iterations
+
+    def __repr__(self):
+        return f"CriticIterations(critic_iterations={self.critic_iterations}, patience={self.patience}, k={self.k}, last_loss={self.last_loss:.4f}, new_loss={self.new_loss:.4f})"
 
 
 def sample_noise(n_dim, z_dim, device="cpu"):
@@ -66,9 +115,9 @@ def get_dataset(file_path: str, transform):
             train_percentage=0.95,
         )
         path_dataset = Path("dataset")
-        dataset_.data = np.load(path_dataset / "cleaned" / "data.npy").reshape(
-            -1, 28, 28
-        )
+        dataset_.data = np.load(
+            path_dataset / "cleaned" / "data_sin_contorno_arriba.npy"
+        ).reshape(-1, 28, 28)
         dataset_.targets = np.ones(len(dataset_.data), dtype=int)
         dataset = dataset_.get_train_data()
         test_dataset = dataset_.get_test_data()
@@ -257,11 +306,10 @@ def train_wgan_and_wae(
             n = real.shape[0]
             real = real.to(device)
 
-            # Train Critic: max E[critic(real)] - E[critic(fake)]
-            # equivalent to minimizing the negative of that
             for _ in range(critic_iterations):
-                noise = G.sample_noise(n)
-                fake = G(noise)
+                # Train Critic: min E[critic(fake)] - E[critic(real)] + penalization
+                z = G.sample_noise(n)
+                fake = G(z)
                 c_real = C(real).reshape(-1)
                 c_fake = C(fake).reshape(-1)
                 gradient, gradient_norm = gradient_penalty(
@@ -269,36 +317,39 @@ def train_wgan_and_wae(
                 )
                 wasserstein_dist_WGAN = torch.mean(c_real) - torch.mean(c_fake)
                 C_loss = -wasserstein_dist_WGAN + penalty_wgan_lp * gradient
+
+                # Update parameters of the critic
                 C.zero_grad()
                 C_loss.backward(retain_graph=True)
                 C_optimizer.step()
 
-            # Train Generator: max E[critic(gen_fake)] <-> min -E[critic(gen_fake)]
-            c_fake = C(fake).reshape(-1)
-            G_loss = -torch.mean(c_fake)
+            for _ in range(critic_iterations):
+                # Train encoder: min |real - generator(encoder(real))| + penalization
+                z = G.sample_noise(n)
+                z_tilde = E(real)  # Generate \tilde{z}_i from Q(Z|x_i) for i = 1:n
+                x_recon = G(z_tilde)
+
+                # According to the paper, this is the Wasserstein distance
+                wasserstein_dist_WAE = criterion(real, x_recon)
+                mmd_loss = imq_kernel(
+                    z, z_tilde, p_distr=G.latent_distr.name
+                )  # Compute MMD
+                E_loss = wasserstein_dist_WAE + penalty_wae * mmd_loss
+
+                # Update parameters of the encoder
+                E.zero_grad()
+                E_loss.backward(retain_graph=True)
+                E_optimizer.step()
+
+            # Train Generator: min Wasserstein distance
+            z = G.sample_noise(n)
+            wasserstein_dist_WGAN_ = torch.mean(C(real)) - torch.mean(C(G(z)))
+            wasserstein_dist_WAE_ = criterion(real, G(E(real)))
+            G_loss = wasserstein_dist_WGAN_ + wasserstein_dist_WAE_
+
+            # Update parameters of the generator
             G.zero_grad()
             G_loss.backward()
-            G_optimizer.step()
-
-            # Train Encoder + Generator
-            # generate noise
-            z = G.sample_noise(n)  # Generate {z_1, ..., z_n} from the prior P_z
-            z_tilde = E(real)  # Generate \tilde{z}_i from Q(Z|x_i) for i = 1:n
-            x_recon = G(z_tilde)
-
-            # According to the paper, this is the Wasserstein distance
-            wasserstein_dist_WAE = criterion(real, x_recon)
-
-            # Compute MMD
-            mmd_loss = imq_kernel(z, z_tilde, p_distr=G.latent_distr.name)
-
-            E_loss = wasserstein_dist_WAE + penalty_wae * mmd_loss
-
-            # Back propagation
-            E.zero_grad()
-            G.zero_grad()
-            E_loss.backward()
-            E_optimizer.step()
             G_optimizer.step()
 
             # loss values
@@ -413,8 +464,8 @@ def train_wgan_and_wae(
                 epoch_wass_dist_WAE_val.append(loss.data.item())
 
                 # WGAN Validation Loss
-                noise = G.sample_noise(n)
-                fake = G(noise)
+                z = G.sample_noise(n)
+                fake = G(z)
                 c_real, c_fake = C(real).reshape(-1), C(fake).reshape(-1)
                 loss = torch.mean(c_real) - torch.mean(c_fake)
                 epoch_wass_dist_WGAN_val.append(loss.data.item())
@@ -496,6 +547,899 @@ def train_wgan_and_wae(
         G_scheduler.step()
         C_scheduler.step()
         E_scheduler.step()
+
+
+# Training methods
+def train_wgan_and_wae_optimized(
+    latent_dim,  # =100
+    nn_kwargs=None,
+    channels_img=3,
+    learning_rate_E=1e-3,
+    learning_rate_G=1e-4,
+    learning_rate_C=1e-4,
+    batch_size=128,
+    image_size=64,
+    num_epochs=100,
+    critic_iterations=5,
+    crit_iter_patience=2,
+    penalty_wgan_lp=10,
+    penalty_wgan_gp=0.05,
+    penalty_wae=10,
+    criterion: Literal["mse", "l1"] = "l1",
+    betas_wgan=(0.5, 0.9),
+    betas_wae=(0.5, 0.999),
+    weight_decay=1e-5,
+    milestones=[25, 50, 75],
+    patience=20,  # Number of epochs to wait for improvement
+    min_delta=0,  # Minimum change in validation loss to be considered as an improvement
+    device=None,
+    transform=None,
+    file_path: str | Literal["mnist", "celeba"] = "shoes_images/shoes.hdf5",
+    save_dir="networks/",
+    summary_writer_dir="logs",
+    verbose=True,
+    report_every=100,
+):
+    device = get_device(device)
+
+    critic_iterations = CriticIterations(critic_iterations, patience=crit_iter_patience)
+
+    # Transforms
+    transform = transform or T.Compose(
+        [
+            T.Resize(image_size),
+            T.ToTensor(),
+            T.Normalize(
+                [0.5 for _ in range(channels_img)], [0.5 for _ in range(channels_img)]
+            ),
+        ]
+    )
+
+    # Dataset and Dataloader
+    dataset, val_dataset = get_dataset(file_path=file_path, transform=transform)
+
+    data_loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    if val_dataset:
+        val_data_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size * 2,
+            shuffle=False,
+            num_workers=NUM_WORKERS,
+            pin_memory=True,
+        )
+
+    # Models
+    if nn_kwargs:
+        G = Generator(latent_dim, channels_img, **nn_kwargs["generator"]).to(device)
+        C = Critic(channels_img, **nn_kwargs["critic"]).to(device)
+        E = Encoder(latent_dim, channels_img, **nn_kwargs["encoder"]).to(device)
+    else:
+        G = Generator(latent_dim, channels_img).to(device)
+        C = Critic(channels_img).to(device)
+        E = Encoder(latent_dim, channels_img).to(device)
+
+    print(C)
+    print(G)
+    print(E)
+
+    # Loss function for WAE
+    match criterion:
+        case "mse":
+            criterion = nn.MSELoss()
+        case "l1":
+            criterion = nn.L1Loss()
+        case _:
+            criterion = criterion
+
+    # Optimizers
+    G_optimizer = optim.Adam(
+        G.parameters(),
+        lr=learning_rate_G,
+        betas=betas_wgan,
+        weight_decay=weight_decay,
+    )
+    C_optimizer = optim.Adam(
+        C.parameters(),
+        lr=learning_rate_C,
+        betas=betas_wgan,
+        weight_decay=weight_decay,
+    )
+    # Optimizer
+    E_optimizer = optim.Adam(
+        E.parameters(),
+        lr=learning_rate_E,
+        betas=betas_wae,
+        weight_decay=weight_decay,
+    )
+
+    # for tensorboard plotting
+    fixed_noise = G.sample_noise(32)
+    summary_writer_dir = Path(summary_writer_dir)
+    summary_writer_dir.mkdir(exist_ok=True, parents=True)
+    writer_real = SummaryWriter(summary_writer_dir / "real")
+    writer_fake = SummaryWriter(summary_writer_dir / "fake")
+    writer_loss = SummaryWriter(summary_writer_dir / "loss")
+    step = 0
+
+    # Directory to save
+    save_dir = Path(save_dir)
+    print(f"{save_dir = }")
+    save_dir.mkdir(exist_ok=True, parents=True)
+
+    # Schedulers
+    G_scheduler = optim.lr_scheduler.MultiStepLR(
+        G_optimizer, milestones=milestones, gamma=0.5
+    )
+    C_scheduler = optim.lr_scheduler.MultiStepLR(
+        C_optimizer, milestones=milestones, gamma=0.5
+    )
+    E_scheduler = optim.lr_scheduler.MultiStepLR(
+        E_optimizer, milestones=milestones, gamma=0.5
+    )
+
+    C.train()
+    G.train()
+    E.train()
+
+    # Early stop
+    current_patience = 0
+    best_validation_loss = float("inf")
+
+    real_val, _ = next(iter(val_data_loader))
+    real_val = real_val.to(device)
+    _penalty_wgan_gp = math.sqrt(
+        penalty_wgan_gp / penalty_wgan_lp
+    )  # the penalty that use the leaky relu
+
+    for epoch in range(1, num_epochs + 1):
+        # Free memory
+        torch.cuda.empty_cache()
+
+        epoch_wass_dist_WGAN = []
+        epoch_wass_dist_WAE = []
+        C_epoch_losses = []
+        G_epoch_losses = []
+        E_epoch_losses = []
+        critic_real_values = []
+        critic_fake_values = []
+        gradient_norm_values = []
+
+        if verbose:
+            iterable = enumerate(
+                tqdm(
+                    data_loader,
+                    desc=f"Epoch [{epoch}/{num_epochs}], Patience {current_patience}",
+                )
+            )
+        else:
+            iterable = enumerate(data_loader)
+
+        # Training loop
+        C_optimizer.zero_grad(set_to_none=True)
+        G_optimizer.zero_grad(set_to_none=True)
+        E_optimizer.zero_grad(set_to_none=True)
+
+        # Scalers
+        C_scaler = torch.cuda.amp.GradScaler()
+        G_scaler = torch.cuda.amp.GradScaler()
+        E_scaler = torch.cuda.amp.GradScaler()
+        for batch_idx, (real, _) in iterable:
+            n = real.shape[0]
+            real = real.to(device, non_blocking=True)
+
+            n_critic_iterations = critic_iterations(epoch)
+            for _ in range(n_critic_iterations):
+                # Train Critic: min E[critic(fake)] - E[critic(real)] + penalization
+                with torch.cuda.amp.autocast():
+                    z = G.sample_noise(n)
+                    fake = G(z)
+                    c_real = C(real).reshape(-1)
+                    c_fake = C(fake).reshape(-1)
+                    gradient, gradient_norm = gradient_penalty(
+                        C, real, fake, device=device, penalty_gr=_penalty_wgan_gp
+                    )
+                    wasserstein_dist_WGAN = torch.mean(c_real) - torch.mean(c_fake)
+                    C_loss = -wasserstein_dist_WGAN + penalty_wgan_lp * gradient
+                # z = G.sample_noise(n)
+                # fake = G(z)
+                # c_real = C(real).reshape(-1)
+                # c_fake = C(fake).reshape(-1)
+                # gradient, gradient_norm = utils.gradient_penalty_improved(
+                #     C, real, fake, device=device, penalty_gr=_penalty_wgan_gp
+                # )
+                # wasserstein_dist_WGAN = torch.mean(c_real) - torch.mean(c_fake)
+                # C_loss = -wasserstein_dist_WGAN + penalty_wgan_lp * gradient
+
+                # Update parameters of the critic
+                # C.zero_grad(set_to_none=True)
+                # C_loss.backward(retain_graph=True)
+                # C_optimizer.step()
+                C_optimizer.zero_grad(set_to_none=True)
+                C_scaler.scale(C_loss).backward(retain_graph=True)
+                C_scaler.step(C_optimizer)
+                C_scaler.update()
+
+            # Train Generator: min Wasserstein distance
+            with torch.cuda.amp.autocast():
+                z = G.sample_noise(n)
+                G_loss = -torch.mean(C(G(z)))  # Generator loss
+                wasserstein_dist_WGAN_ = torch.mean(C(real)) + G_loss
+                wasserstein_dist_WAE_ = criterion(real, G(E(real)))
+                G_loss_ = wasserstein_dist_WGAN_ + wasserstein_dist_WAE_
+
+            # # Train Generator: min Wasserstein distance
+            # z = G.sample_noise(n)
+            # wasserstein_dist_WGAN_ = torch.mean(C(real)) - torch.mean(C(G(z)))
+            # wasserstein_dist_WAE_ = criterion(real, G(E(real)))
+            # G_loss = wasserstein_dist_WGAN_ + wasserstein_dist_WAE_
+
+            # Update parameters of the generator
+            # G.zero_grad(set_to_none=True)
+            # G_loss.backward()
+            # G_optimizer.step()
+            G_optimizer.zero_grad(set_to_none=True)
+            G_scaler.scale(G_loss).backward()
+            G_scaler.step(G_optimizer)
+            G_scaler.update()
+
+            # for _ in range(critic_iterations):
+            # Train encoder: min |real - generator(encoder(real))| + penalization
+            with torch.cuda.amp.autocast():
+                z = G.sample_noise(n)
+                z_tilde = E(real)  # Generate \tilde{z}_i from Q(Z|x_i) for i = 1:n
+                x_recon = G(z_tilde)
+
+                # According to the paper, this is the Wasserstein distance
+                wasserstein_dist_WAE = criterion(real, x_recon)
+                mmd_loss = imq_kernel(
+                    z, z_tilde, p_distr=G.latent_distr.name
+                )  # Compute MMD
+                E_loss = wasserstein_dist_WAE + penalty_wae * mmd_loss
+
+            # # Train encoder: min |real - generator(encoder(real))| + penalization
+            # z = G.sample_noise(n)
+            # z_tilde = E(real)  # Generate \tilde{z}_i from Q(Z|x_i) for i = 1:n
+            # x_recon = G(z_tilde)
+
+            # # According to the paper, this is the Wasserstein distance
+            # wasserstein_dist_WAE = criterion(real, x_recon)
+            # mmd_loss = imq_kernel(
+            #     z, z_tilde, p_distr=G.latent_distr.name
+            # )  # Compute MMD
+            # E_loss = wasserstein_dist_WAE + penalty_wae * mmd_loss
+
+            # Update parameters of the encoder
+            # E.zero_grad(set_to_none=True)
+            # E_loss.backward(retain_graph=True)
+            # E_optimizer.step()
+            E_optimizer.zero_grad(set_to_none=True)
+            G_optimizer.zero_grad(set_to_none=True)
+            E_scaler.scale(E_loss).backward()
+            E_scaler.step(E_optimizer)
+            G_scaler.step(G_optimizer)
+            E_scaler.update()
+            G_scaler.update()
+
+            # loss values
+            # Register occasionally
+            if batch_idx % report_every == 0:
+                epoch_wass_dist_WGAN.append(wasserstein_dist_WGAN.data.item())
+                epoch_wass_dist_WAE.append(wasserstein_dist_WAE.data.item())
+
+                C_epoch_losses.append(C_loss.data.item())
+                G_epoch_losses.append(G_loss.data.item())
+                E_epoch_losses.append(E_loss.data.item())
+                critic_real_value = torch.mean(c_real)
+                critic_fake_value = torch.mean(c_fake)
+                critic_real_values.append(critic_real_value.data.item())
+                critic_fake_values.append(critic_fake_value.data.item())
+                gradient_norm_mean = torch.mean(gradient_norm)
+                gradient_norm_values.append(gradient_norm_mean.data.item())
+
+            # Print losses occasionally and print to tensorboard
+            if batch_idx % report_every == 0:
+                with torch.no_grad():
+                    fake_WGAN = G(fixed_noise)
+                    fake_WAE = G(E(real))
+                    fake_val_WAE = G(E(real_val))
+
+                    # take out (up to) 32 examples
+                    img_grid_real = torchvision.utils.make_grid(
+                        real[:32], normalize=True
+                    )
+                    img_grid_real_val = torchvision.utils.make_grid(
+                        real_val[:32], normalize=True
+                    )
+                    img_grid_fake_WGAN = torchvision.utils.make_grid(
+                        fake_WGAN[:32], normalize=True
+                    )
+                    img_grid_fake_WAE = torchvision.utils.make_grid(
+                        fake_WAE[:32], normalize=True
+                    )
+                    img_grid_fake_val_WAE = torchvision.utils.make_grid(
+                        fake_val_WAE[:32], normalize=True
+                    )
+
+                    loss_C_name = "Loss Discriminator"
+                    loss_G_name = "Loss Generator"
+                    loss_E_name = "Loss Encoder"
+                    critic_values_name = "Critic Values"
+                    wass_dist_name_WGAN = "Wasserstein Distance WGAN"
+                    wass_dist_name_WAE = "Wasserstein Distance WAE"
+                    gradient_norm_name = "Gradient Norm"
+                    writer_real.add_image("1 Real", img_grid_real, global_step=step)
+                    writer_fake.add_image(
+                        "2 Decoded", img_grid_fake_WAE, global_step=step
+                    )
+                    writer_real.add_image(
+                        "3 Real Val", img_grid_real_val, global_step=step
+                    )
+                    writer_fake.add_image(
+                        "4 Decoded Val", img_grid_fake_val_WAE, global_step=step
+                    )
+                    writer_fake.add_image(
+                        "5 Generated", img_grid_fake_WGAN, global_step=step
+                    )
+                    writer_loss.add_scalars(
+                        loss_C_name, {loss_C_name: C_loss}, global_step=step
+                    )
+                    writer_loss.add_scalars(
+                        loss_G_name, {loss_G_name: G_loss}, global_step=step
+                    )
+                    writer_loss.add_scalars(
+                        loss_E_name, {loss_E_name: E_loss}, global_step=step
+                    )
+                    writer_loss.add_scalars(
+                        wass_dist_name_WGAN,
+                        {wass_dist_name_WGAN: wasserstein_dist_WGAN},
+                        global_step=step,
+                    )
+                    writer_loss.add_scalars(
+                        wass_dist_name_WAE,
+                        {wass_dist_name_WAE: wasserstein_dist_WAE},
+                        global_step=step,
+                    )
+                    writer_loss.add_scalars(
+                        gradient_norm_name,
+                        {gradient_norm_name: gradient_norm_mean},
+                        global_step=step,
+                    )
+                    writer_loss.add_scalars(
+                        critic_values_name,
+                        {
+                            "Real": critic_real_value,
+                            "Fake": critic_fake_value,
+                        },
+                        global_step=step,
+                    )
+
+                step += 1
+
+        # Validation loop
+        if verbose:
+            iterable = tqdm(val_data_loader, desc=f"Val. Epoch [{epoch}/{num_epochs}]")
+        else:
+            iterable = val_data_loader
+
+        epoch_wass_dist_WAE_val = []
+        epoch_wass_dist_WGAN_val = []
+        with torch.no_grad():
+            for real, _ in iterable:
+                real = real.to(device, non_blocking=True)
+                n = real.shape[0]
+
+                # WAE Validation Loss
+                recon = G(E(real))
+                loss = criterion(real, recon)
+                epoch_wass_dist_WAE_val.append(loss.data.item())
+
+                # WGAN Validation Loss
+                z = G.sample_noise(n)
+                fake = G(z)
+                c_real, c_fake = C(real).reshape(-1), C(fake).reshape(-1)
+                loss = torch.mean(c_real) - torch.mean(c_fake)
+                epoch_wass_dist_WGAN_val.append(loss.data.item())
+
+        # Calculate the average validation loss
+        avg_wass_dist_WAE_val = torch.mean(
+            torch.FloatTensor(epoch_wass_dist_WAE_val)
+        ).item()
+        avg_wass_dist_WGAN_val = torch.mean(
+            torch.FloatTensor(epoch_wass_dist_WGAN_val)
+        ).item()
+
+        if avg_wass_dist_WAE_val < best_validation_loss - min_delta:
+            best_validation_loss = avg_wass_dist_WAE_val
+            current_patience = 0
+            # Save models
+            torch.save(G.state_dict(), save_dir / "generator")
+            torch.save(C.state_dict(), save_dir / "discriminator")
+            torch.save(E.state_dict(), save_dir / "encoder")
+        else:
+            current_patience += 1
+
+        global_epoch = step - 1
+        avg_wass_dist_WGAN = torch.mean(torch.FloatTensor(epoch_wass_dist_WGAN)).item()
+        avg_wass_dist_WAE = torch.mean(torch.FloatTensor(epoch_wass_dist_WAE)).item()
+        C_avg_loss = torch.mean(torch.FloatTensor(C_epoch_losses)).item()
+        G_avg_loss = torch.mean(torch.FloatTensor(G_epoch_losses)).item()
+        E_avg_loss = torch.mean(torch.FloatTensor(E_epoch_losses)).item()
+        critic_real_avg_loss = torch.mean(torch.FloatTensor(critic_real_values)).item()
+        critic_fake_avg_loss = torch.mean(torch.FloatTensor(critic_fake_values)).item()
+        critic_iterations.register_new_loss(
+            (critic_real_avg_loss + critic_fake_avg_loss) / 2
+        )
+        print(f"{critic_iterations = }")
+        gradient_norm_values_avg = torch.mean(
+            torch.FloatTensor(gradient_norm_values)
+        ).item()
+        writer_loss.add_scalars(
+            wass_dist_name_WGAN,
+            {"Avg. " + wass_dist_name_WGAN: avg_wass_dist_WGAN},
+            global_epoch,
+        )
+        writer_loss.add_scalars(
+            wass_dist_name_WAE,
+            {"Avg. " + wass_dist_name_WAE: avg_wass_dist_WAE},
+            global_epoch,
+        )
+        writer_loss.add_scalars(
+            gradient_norm_name,
+            {"Avg. " + gradient_norm_name: gradient_norm_values_avg},
+            global_epoch,
+        )
+        writer_loss.add_scalars(
+            loss_C_name, {"Avg. " + loss_C_name: C_avg_loss}, global_epoch
+        )
+        writer_loss.add_scalars(
+            loss_G_name, {"Avg. " + loss_G_name: G_avg_loss}, global_epoch
+        )
+        writer_loss.add_scalars(
+            loss_E_name, {"Avg. " + loss_E_name: E_avg_loss}, global_epoch
+        )
+        writer_loss.add_scalars(
+            critic_values_name,
+            {"Avg. Real": critic_real_avg_loss, "Avg. Fake": critic_fake_avg_loss},
+            global_epoch,
+        )
+        writer_loss.add_scalars(
+            wass_dist_name_WAE,
+            {"Avg. " + wass_dist_name_WAE + " Validation": avg_wass_dist_WAE_val},
+            global_epoch,
+        )
+        writer_loss.add_scalars(
+            wass_dist_name_WGAN,
+            {"Avg. " + wass_dist_name_WGAN + " Validation": avg_wass_dist_WGAN_val},
+            global_epoch,
+        )
+
+        if current_patience >= patience:
+            print("Early stopping triggered. Training halted.")
+            break
+
+        # Decrease learning-rate
+        G_scheduler.step()
+        C_scheduler.step()
+        E_scheduler.step()
+
+
+# Training methods
+# def train_wgan_and_wae(
+#     latent_dim,  # =100
+#     nn_kwargs=None,
+#     channels_img=3,
+#     learning_rate_E=1e-3,
+#     learning_rate_G=1e-4,
+#     learning_rate_C=1e-4,
+#     batch_size=128,
+#     image_size=64,
+#     num_epochs=100,
+#     critic_iterations=5,
+#     penalty_wgan_lp=10,
+#     penalty_wgan_gp=0.05,
+#     penalty_wae=10,
+#     criterion: Literal["mse", "l1"] = "l1",
+#     betas_wgan=(0.5, 0.9),
+#     betas_wae=(0.5, 0.999),
+#     weight_decay=1e-5,
+#     milestones=[25, 50, 75],
+#     patience=10,  # Number of epochs to wait for improvement
+#     min_delta=0,  # Minimum change in validation loss to be considered as an improvement
+#     device=None,
+#     transform=None,
+#     file_path: str | Literal["mnist", "celeba"] = "shoes_images/shoes.hdf5",
+#     save_dir="networks/",
+#     summary_writer_dir="logs",
+#     verbose=True,
+#     report_every=100,
+# ):
+#     device = get_device(device)
+
+#     # Transforms
+#     transform = transform or T.Compose(
+#         [
+#             T.Resize(image_size),
+#             T.ToTensor(),
+#             T.Normalize(
+#                 [0.5 for _ in range(channels_img)], [0.5 for _ in range(channels_img)]
+#             ),
+#         ]
+#     )
+
+#     # Dataset and Dataloader
+#     dataset, val_dataset = get_dataset(file_path=file_path, transform=transform)
+
+#     data_loader = DataLoader(
+#         dataset,
+#         batch_size=batch_size,
+#         shuffle=True,
+#         num_workers=NUM_WORKERS,
+#     )
+
+#     if val_dataset:
+#         val_data_loader = DataLoader(
+#             val_dataset,
+#             batch_size=batch_size * 2,
+#             shuffle=False,
+#             num_workers=NUM_WORKERS,
+#         )
+
+#     # Models
+#     if nn_kwargs:
+#         G = Generator(latent_dim, channels_img, **nn_kwargs["generator"]).to(device)
+#         C = Critic(channels_img, **nn_kwargs["critic"]).to(device)
+#         E = Encoder(latent_dim, channels_img, **nn_kwargs["encoder"]).to(device)
+#     else:
+#         G = Generator(latent_dim, channels_img).to(device)
+#         C = Critic(channels_img).to(device)
+#         E = Encoder(latent_dim, channels_img).to(device)
+
+#     print(C)
+#     print(G)
+#     print(E)
+
+#     # Loss function for WAE
+#     match criterion:
+#         case "mse":
+#             criterion = nn.MSELoss()
+#         case "l1":
+#             criterion = nn.L1Loss()
+#         case _:
+#             criterion = criterion
+
+#     # Optimizers
+#     G_optimizer = optim.Adam(
+#         G.parameters(),
+#         lr=learning_rate_G,
+#         betas=betas_wgan,
+#         weight_decay=weight_decay,
+#     )
+#     C_optimizer = optim.Adam(
+#         C.parameters(),
+#         lr=learning_rate_C,
+#         betas=betas_wgan,
+#         weight_decay=weight_decay,
+#     )
+#     # Optimizer
+#     E_optimizer = optim.Adam(
+#         E.parameters(),
+#         lr=learning_rate_E,
+#         betas=betas_wae,
+#         weight_decay=weight_decay,
+#     )
+
+#     # for tensorboard plotting
+#     fixed_noise = G.sample_noise(32)
+#     summary_writer_dir = Path(summary_writer_dir)
+#     summary_writer_dir.mkdir(exist_ok=True, parents=True)
+#     writer_real = SummaryWriter(summary_writer_dir / "real")
+#     writer_fake = SummaryWriter(summary_writer_dir / "fake")
+#     writer_loss = SummaryWriter(summary_writer_dir / "loss")
+#     step = 0
+
+#     # Directory to save
+#     save_dir = Path(save_dir)
+#     save_dir.mkdir(exist_ok=True, parents=True)
+
+#     # Schedulers
+#     G_scheduler = optim.lr_scheduler.MultiStepLR(
+#         G_optimizer, milestones=milestones, gamma=0.5
+#     )
+#     C_scheduler = optim.lr_scheduler.MultiStepLR(
+#         C_optimizer, milestones=milestones, gamma=0.5
+#     )
+#     E_scheduler = optim.lr_scheduler.MultiStepLR(
+#         E_optimizer, milestones=milestones, gamma=0.5
+#     )
+
+#     C.train()
+#     G.train()
+#     E.train()
+
+#     # Early stop
+#     current_patience = 0
+#     best_validation_loss = float("inf")
+
+#     real_val, _ = next(iter(val_data_loader))
+#     real_val = real_val.to(device)
+#     _penalty_wgan_gp = math.sqrt(
+#         penalty_wgan_gp / penalty_wgan_lp
+#     )  # the penalty that use the leaky relu
+
+#     for epoch in range(1, num_epochs + 1):
+#         # Free memory
+#         torch.cuda.empty_cache()
+
+#         epoch_wass_dist_WGAN = []
+#         epoch_wass_dist_WAE = []
+#         C_epoch_losses = []
+#         G_epoch_losses = []
+#         E_epoch_losses = []
+#         critic_real_values = []
+#         critic_fake_values = []
+#         gradient_norm_values = []
+
+#         if verbose:
+#             iterable = enumerate(
+#                 tqdm(
+#                     data_loader,
+#                     desc=f"Epoch [{epoch}/{num_epochs}], Patience {current_patience}",
+#                 )
+#             )
+#         else:
+#             iterable = enumerate(data_loader)
+
+#         # Training loop
+#         for batch_idx, (real, _) in iterable:
+#             n = real.shape[0]
+#             real = real.to(device)
+
+#             # Train Critic: max E[critic(real)] - E[critic(fake)]
+#             # equivalent to minimizing the negative of that
+#             for _ in range(critic_iterations):
+#                 noise = G.sample_noise(n)
+#                 fake = G(noise)
+#                 c_real = C(real).reshape(-1)
+#                 c_fake = C(fake).reshape(-1)
+#                 gradient, gradient_norm = gradient_penalty(
+#                     C, real, fake, device=device, penalty_gr=_penalty_wgan_gp
+#                 )
+#                 wasserstein_dist_WGAN = torch.mean(c_real) - torch.mean(c_fake)
+#                 C_loss = -wasserstein_dist_WGAN + penalty_wgan_lp * gradient
+#                 C.zero_grad()
+#                 C_loss.backward(retain_graph=True)
+#                 C_optimizer.step()
+
+#             # Train Generator: max E[critic(gen_fake)] <-> min -E[critic(gen_fake)]
+#             c_fake = C(fake).reshape(-1)
+#             G_loss = -torch.mean(c_fake)
+#             G.zero_grad()
+#             G_loss.backward()
+#             G_optimizer.step()
+
+#             # Train Encoder + Generator
+#             # generate noise
+#             z = G.sample_noise(n)  # Generate {z_1, ..., z_n} from the prior P_z
+#             z_tilde = E(real)  # Generate \tilde{z}_i from Q(Z|x_i) for i = 1:n
+#             x_recon = G(z_tilde)
+
+#             # According to the paper, this is the Wasserstein distance
+#             wasserstein_dist_WAE = criterion(real, x_recon)
+
+#             # Compute MMD
+#             mmd_loss = imq_kernel(z, z_tilde, p_distr=G.latent_distr.name)
+
+#             E_loss = wasserstein_dist_WAE + penalty_wae * mmd_loss
+
+#             # Back propagation
+#             E.zero_grad()
+#             G.zero_grad()
+#             E_loss.backward()
+#             E_optimizer.step()
+#             G_optimizer.step()
+
+#             # loss values
+#             epoch_wass_dist_WGAN.append(wasserstein_dist_WGAN.data.item())
+#             epoch_wass_dist_WAE.append(wasserstein_dist_WAE.data.item())
+
+#             C_epoch_losses.append(C_loss.data.item())
+#             G_epoch_losses.append(G_loss.data.item())
+#             E_epoch_losses.append(E_loss.data.item())
+#             critic_real_value = torch.mean(c_real)
+#             critic_fake_value = torch.mean(c_fake)
+#             critic_real_values.append(critic_real_value.data.item())
+#             critic_fake_values.append(critic_fake_value.data.item())
+#             gradient_norm_mean = torch.mean(gradient_norm)
+#             gradient_norm_values.append(gradient_norm_mean.data.item())
+
+#             # Print losses occasionally and print to tensorboard
+#             if batch_idx % report_every == 0:
+#                 with torch.no_grad():
+#                     fake_WGAN = G(fixed_noise)
+#                     fake_WAE = G(E(real))
+#                     fake_val_WAE = G(E(real_val))
+
+#                     # take out (up to) 32 examples
+#                     img_grid_real = torchvision.utils.make_grid(
+#                         real[:32], normalize=True
+#                     )
+#                     img_grid_real_val = torchvision.utils.make_grid(
+#                         real_val[:32], normalize=True
+#                     )
+#                     img_grid_fake_WGAN = torchvision.utils.make_grid(
+#                         fake_WGAN[:32], normalize=True
+#                     )
+#                     img_grid_fake_WAE = torchvision.utils.make_grid(
+#                         fake_WAE[:32], normalize=True
+#                     )
+#                     img_grid_fake_val_WAE = torchvision.utils.make_grid(
+#                         fake_val_WAE[:32], normalize=True
+#                     )
+
+#                     loss_C_name = "Loss Discriminator"
+#                     loss_G_name = "Loss Generator"
+#                     loss_E_name = "Loss Encoder"
+#                     critic_values_name = "Critic Values"
+#                     wass_dist_name_WGAN = "Wasserstein Distance WGAN"
+#                     wass_dist_name_WAE = "Wasserstein Distance WAE"
+#                     gradient_norm_name = "Gradient Norm"
+#                     writer_real.add_image("1 Real", img_grid_real, global_step=step)
+#                     writer_fake.add_image(
+#                         "2 Decoded", img_grid_fake_WAE, global_step=step
+#                     )
+#                     writer_real.add_image(
+#                         "3 Real Val", img_grid_real_val, global_step=step
+#                     )
+#                     writer_fake.add_image(
+#                         "4 Decoded Val", img_grid_fake_val_WAE, global_step=step
+#                     )
+#                     writer_fake.add_image(
+#                         "5 Generated", img_grid_fake_WGAN, global_step=step
+#                     )
+#                     writer_loss.add_scalars(
+#                         loss_C_name, {loss_C_name: C_loss}, global_step=step
+#                     )
+#                     writer_loss.add_scalars(
+#                         loss_G_name, {loss_G_name: G_loss}, global_step=step
+#                     )
+#                     writer_loss.add_scalars(
+#                         loss_E_name, {loss_E_name: E_loss}, global_step=step
+#                     )
+#                     writer_loss.add_scalars(
+#                         wass_dist_name_WGAN,
+#                         {wass_dist_name_WGAN: wasserstein_dist_WGAN},
+#                         global_step=step,
+#                     )
+#                     writer_loss.add_scalars(
+#                         wass_dist_name_WAE,
+#                         {wass_dist_name_WAE: wasserstein_dist_WAE},
+#                         global_step=step,
+#                     )
+#                     writer_loss.add_scalars(
+#                         gradient_norm_name,
+#                         {gradient_norm_name: gradient_norm_mean},
+#                         global_step=step,
+#                     )
+#                     writer_loss.add_scalars(
+#                         critic_values_name,
+#                         {
+#                             "Real": critic_real_value,
+#                             "Fake": critic_fake_value,
+#                         },
+#                         global_step=step,
+#                     )
+
+#                 step += 1
+
+#         # Validation loop
+#         if verbose:
+#             iterable = tqdm(val_data_loader, desc=f"Val. Epoch [{epoch}/{num_epochs}]")
+#         else:
+#             iterable = val_data_loader
+
+#         epoch_wass_dist_WAE_val = []
+#         epoch_wass_dist_WGAN_val = []
+#         with torch.no_grad():
+#             for real, _ in iterable:
+#                 real = real.to(device)
+#                 n = real.shape[0]
+
+#                 # WAE Validation Loss
+#                 recon = G(E(real))
+#                 loss = criterion(real, recon)
+#                 epoch_wass_dist_WAE_val.append(loss.data.item())
+
+#                 # WGAN Validation Loss
+#                 noise = G.sample_noise(n)
+#                 fake = G(noise)
+#                 c_real, c_fake = C(real).reshape(-1), C(fake).reshape(-1)
+#                 loss = torch.mean(c_real) - torch.mean(c_fake)
+#                 epoch_wass_dist_WGAN_val.append(loss.data.item())
+
+#         # Calculate the average validation loss
+#         avg_wass_dist_WAE_val = torch.mean(
+#             torch.FloatTensor(epoch_wass_dist_WAE_val)
+#         ).item()
+#         avg_wass_dist_WGAN_val = torch.mean(
+#             torch.FloatTensor(epoch_wass_dist_WGAN_val)
+#         ).item()
+
+#         if avg_wass_dist_WAE_val < best_validation_loss - min_delta:
+#             best_validation_loss = avg_wass_dist_WAE_val
+#             current_patience = 0
+#             # Save models
+#             torch.save(G.state_dict(), save_dir / "generator")
+#             torch.save(C.state_dict(), save_dir / "discriminator")
+#             torch.save(E.state_dict(), save_dir / "encoder")
+#         else:
+#             current_patience += 1
+
+#         global_epoch = step - 1
+#         avg_wass_dist_WGAN = torch.mean(torch.FloatTensor(epoch_wass_dist_WGAN)).item()
+#         avg_wass_dist_WAE = torch.mean(torch.FloatTensor(epoch_wass_dist_WAE)).item()
+#         C_avg_loss = torch.mean(torch.FloatTensor(C_epoch_losses)).item()
+#         G_avg_loss = torch.mean(torch.FloatTensor(G_epoch_losses)).item()
+#         E_avg_loss = torch.mean(torch.FloatTensor(E_epoch_losses)).item()
+#         critic_real_avg_loss = torch.mean(torch.FloatTensor(critic_real_values)).item()
+#         critic_fake_avg_loss = torch.mean(torch.FloatTensor(critic_fake_values)).item()
+#         gradient_norm_values_avg = torch.mean(
+#             torch.FloatTensor(gradient_norm_values)
+#         ).item()
+#         writer_loss.add_scalars(
+#             wass_dist_name_WGAN,
+#             {"Avg. " + wass_dist_name_WGAN: avg_wass_dist_WGAN},
+#             global_epoch,
+#         )
+#         writer_loss.add_scalars(
+#             wass_dist_name_WAE,
+#             {"Avg. " + wass_dist_name_WAE: avg_wass_dist_WAE},
+#             global_epoch,
+#         )
+#         writer_loss.add_scalars(
+#             gradient_norm_name,
+#             {"Avg. " + gradient_norm_name: gradient_norm_values_avg},
+#             global_epoch,
+#         )
+#         writer_loss.add_scalars(
+#             loss_C_name, {"Avg. " + loss_C_name: C_avg_loss}, global_epoch
+#         )
+#         writer_loss.add_scalars(
+#             loss_G_name, {"Avg. " + loss_G_name: G_avg_loss}, global_epoch
+#         )
+#         writer_loss.add_scalars(
+#             loss_E_name, {"Avg. " + loss_E_name: E_avg_loss}, global_epoch
+#         )
+#         writer_loss.add_scalars(
+#             critic_values_name,
+#             {"Avg. Real": critic_real_avg_loss, "Avg. Fake": critic_fake_avg_loss},
+#             global_epoch,
+#         )
+#         writer_loss.add_scalars(
+#             wass_dist_name_WAE,
+#             {"Avg. " + wass_dist_name_WAE + " Validation": avg_wass_dist_WAE_val},
+#             global_epoch,
+#         )
+#         writer_loss.add_scalars(
+#             wass_dist_name_WGAN,
+#             {"Avg. " + wass_dist_name_WGAN + " Validation": avg_wass_dist_WGAN_val},
+#             global_epoch,
+#         )
+
+#         if current_patience >= patience:
+#             print("Early stopping triggered. Training halted.")
+#             break
+
+#         # Decrease learning-rate
+#         G_scheduler.step()
+#         C_scheduler.step()
+#         E_scheduler.step()
 
 
 # Training methods
@@ -1185,6 +2129,9 @@ if __name__ == "__main__":
     NUM_EPOCHS = 100
     REPORT_EVERY = 10
     # FILE_PATH = "/home/fmunoz/codeProjects/pythonProjects/wgan-gp/dataset/quick_draw/face_recognized.npy"
+    # FILE_PATH = (
+    #     "/home/fmunoz/codeProjects/pythonProjects/wgan-gp/dataset/cleaned/data.npy"
+    # )
     FILE_PATH = "quickdraw"
     TRANSFORM = T.Compose(
         [
@@ -1210,10 +2157,18 @@ if __name__ == "__main__":
         "generator": dict(Block=ResidualBlock, latent_distr=NOISE_NAME),
         "critic": dict(Block=ResidualBlock),
     }
-    NAME_DIR = f"_resnet_face_zDim{LATENT_DIM}_{NOISE_NAME}_bs_{BATCH_SIZE}_cleaned_augmented_WAE_WGAN_loss_{CRITERION}_{size_x}p{size_y}"
+    NAME_DIR = f"_resnet_face_zDim{LATENT_DIM}_{NOISE_NAME}_bs_{BATCH_SIZE}_cleaned_sin_contorno_arriba_augmented_WAE_WGAN_loss_{CRITERION}_{size_x}p{size_y}"
     SAVE_DIR = Path("networks") / NAME_DIR
     SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
-    train_wgan_and_wae(
+
+    def CRITIC_ITERATIONS(epoch):
+        if epoch <= 10:
+            return 5
+        elif epoch <= 40:
+            return 3
+        return 2
+
+    train_wgan_and_wae_optimized(
         nn_kwargs=NN_KWARGS,
         latent_dim=LATENT_DIM,
         channels_img=CHANNELS_IMG,
@@ -1232,37 +2187,41 @@ if __name__ == "__main__":
         report_every=REPORT_EVERY,
         milestones=MILESTONES,
         criterion=CRITERION,
+        critic_iterations=7,
+        crit_iter_patience=5,
+        patience=50,
+        # critic_iterations=CRITIC_ITERATIONS,
     )
 
-    LATENT_DIM = 64
-    NN_KWARGS = {
-        "encoder": dict(Block=ResidualBlock),
-        "generator": dict(Block=ResidualBlock, latent_distr=NOISE_NAME),
-        "critic": dict(Block=ResidualBlock),
-    }
-    NAME_DIR = f"_resnet_face_zDim{LATENT_DIM}_{NOISE_NAME}_bs_{BATCH_SIZE}_cleaned_augmented_WAE_WGAN_loss_{CRITERION}_{size_x}p{size_y}"
-    SAVE_DIR = Path("networks") / NAME_DIR
-    SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
-    train_wgan_and_wae(
-        nn_kwargs=NN_KWARGS,
-        latent_dim=LATENT_DIM,
-        channels_img=CHANNELS_IMG,
-        image_size=IMAGE_SIZE,
-        learning_rate_E=3e-4,
-        learning_rate_C=3e-4,
-        learning_rate_G=3e-4,
-        betas_wgan=(0.5, 0.9),
-        betas_wae=(0.5, 0.9),
-        batch_size=BATCH_SIZE,
-        num_epochs=NUM_EPOCHS,
-        file_path=FILE_PATH,
-        save_dir=SAVE_DIR,
-        summary_writer_dir=SUMMARY_WRITER_DIR,
-        transform=TRANSFORM,
-        report_every=REPORT_EVERY,
-        milestones=MILESTONES,
-        criterion=CRITERION,
-    )
+    # LATENT_DIM = 64
+    # NN_KWARGS = {
+    #     "encoder": dict(Block=ResidualBlock),
+    #     "generator": dict(Block=ResidualBlock, latent_distr=NOISE_NAME),
+    #     "critic": dict(Block=ResidualBlock),
+    # }
+    # NAME_DIR = f"_resnet_face_zDim{LATENT_DIM}_{NOISE_NAME}_bs_{BATCH_SIZE}_cleaned_augmented_WAE_WGAN_loss_{CRITERION}_{size_x}p{size_y}"
+    # SAVE_DIR = Path("networks") / NAME_DIR
+    # SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
+    # train_wgan_and_wae(
+    #     nn_kwargs=NN_KWARGS,
+    #     latent_dim=LATENT_DIM,
+    #     channels_img=CHANNELS_IMG,
+    #     image_size=IMAGE_SIZE,
+    #     learning_rate_E=3e-4,
+    #     learning_rate_C=3e-4,
+    #     learning_rate_G=3e-4,
+    #     betas_wgan=(0.5, 0.9),
+    #     betas_wae=(0.5, 0.9),
+    #     batch_size=BATCH_SIZE,
+    #     num_epochs=NUM_EPOCHS,
+    #     file_path=FILE_PATH,
+    #     save_dir=SAVE_DIR,
+    #     summary_writer_dir=SUMMARY_WRITER_DIR,
+    #     transform=TRANSFORM,
+    #     report_every=REPORT_EVERY,
+    #     milestones=MILESTONES,
+    #     criterion=CRITERION,
+    # )
 
     # input(msg)
     # LATENT_DIM = 64

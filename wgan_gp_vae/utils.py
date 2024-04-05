@@ -11,6 +11,49 @@ _models_option = "encoder", "generator"
 TypeModels = Literal["encoder", "generator"]
 
 
+@torch.jit.script
+def interpolate_images(real: torch.Tensor, fake: torch.Tensor, alpha: torch.Tensor):
+    return real * alpha + fake * (1 - alpha)
+
+
+@torch.jit.script
+def compute_gradient_penalty_norm(gradient: torch.Tensor, penalty_gr: float):
+    gradient_norm = gradient.norm(2, dim=1)
+    gradient_penalty = torch.mean(F.leaky_relu(gradient_norm - 1, penalty_gr) ** 2)
+    return gradient_penalty, gradient_norm
+
+
+def gradient_penalty_improved(
+    critic: nn.Module,
+    real: torch.Tensor,
+    fake: torch.Tensor,
+    device="cpu",
+    penalty_gr: float = 10.0,
+):
+    BATCH_SIZE, C, H, W = real.shape
+    alpha = torch.rand((BATCH_SIZE, 1, 1, 1), device=device).repeat(1, C, H, W)
+    interpolated_images = interpolate_images(real, fake, alpha)
+
+    # Calculate critic scores
+
+    mixed_scores = critic(interpolated_images)
+
+    # Take the gradient of the scores with respect to the images
+    gradient = torch.autograd.grad(
+        inputs=interpolated_images,
+        outputs=mixed_scores,
+        grad_outputs=torch.ones_like(mixed_scores),
+        create_graph=True,
+        retain_graph=True,
+    )[0]
+    gradient = gradient.view(gradient.shape[0], -1)
+    gradient_penalty, gradient_norm = compute_gradient_penalty_norm(
+        gradient,  # torch.as_tensor(penalty_gr, device=device)
+        penalty_gr,
+    )
+    return gradient_penalty, gradient_norm
+
+
 def gradient_penalty(critic, real, fake, device="cpu", penalty_gr=10):
     device = torch.device(device)
     BATCH_SIZE, C, H, W = real.shape
