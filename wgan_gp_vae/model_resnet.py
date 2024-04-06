@@ -226,9 +226,7 @@ class latent_distr(abc.ABC):
 
 
 class unif(latent_distr):
-    def __init__(
-        self, z_dim: int = 100, device: _device_t = "cpu", a: float = -1, b: float = 1
-    ):
+    def __init__(self, z_dim: int, device: _device_t, a: float = -1, b: float = 1):
         self.z_dim = z_dim
         self.a = torch.tensor(float(a), device=device)
         self.b = torch.tensor(float(b), device=device)
@@ -250,8 +248,8 @@ class unif(latent_distr):
 class norm(latent_distr):
     def __init__(
         self,
-        z_dim: int = 100,
-        device: _device_t = "cpu",
+        z_dim: int,
+        device: _device_t,
         loc: float = 0,
         scale: float = 1,
     ):
@@ -274,9 +272,28 @@ _LATENT_DISTR = {
 }
 
 
+class LatentDistribution:
+    def __init__(
+        self,
+        name: Literal["unif", "norm"],
+        z_dim: int,
+        device: _device_t = "cpu",
+        **kwargs,
+    ):
+        self.name = name
+        self.device = device
+        self.z_dim = z_dim
+        self._lat_distr = _LATENT_DISTR[name](z_dim=z_dim, device=device, **kwargs)
+
+    def __call__(self, n_dim: int):
+        return self._lat_distr(n_dim)
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}(name={self.name}, z_dim={self.z_dim}, device={self.device})"
+
+
 # Generator model
 class Generator(nn.Module):
-    latent_distr_name: Literal["unif", "norm"] = "norm"
 
     def __init__(
         self,
@@ -310,7 +327,8 @@ class Generator(nn.Module):
         self.conv_out = nn.Conv2d(
             num_filters[-1], channels_img, kernel_size=3, padding=1
         )
-        self._latent_distr = _LATENT_DISTR[latent_distr]
+        self.latent_distr_name: Literal["unif", "norm"] = latent_distr
+        # self._latent_distr = _LATENT_DISTR[latent_distr]
 
     # @property
     # def device(self) -> torch.device:
@@ -331,11 +349,11 @@ class Generator(nn.Module):
         x = F.tanh(x)
         return x
 
-    def sample_noise(self, n: int, type_as=None) -> torch.Tensor:
-        if type_as is None:
-            return self._latent_distr(z_dim=self.latent_dim)(n)
-        else:
-            return self._latent_distr(z_dim=self.latent_dim, device=type_as.device)(n)
+    # def sample_noise(self, n: int, type_as=None) -> torch.Tensor:
+    #     if type_as is None:
+    #         return self._latent_distr(z_dim=self.latent_dim)(n)
+    #     else:
+    #         return self._latent_distr(z_dim=self.latent_dim, device=type_as.device)(n)
 
 
 # critic model

@@ -20,7 +20,7 @@ import torchvision.datasets as datasets
 import torchvision.models as models
 import torchvision.transforms.v2 as T
 import utils
-from model_resnet import Critic, Encoder, Generator, ResidualBlock
+from model_resnet import Critic, Encoder, Generator, LatentDistribution, ResidualBlock
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -45,9 +45,9 @@ class CriticIterations:
         self.max_loss = -float("inf")
         self.new_loss = -float("inf")
         self.diff_loss = -float("inf")
-        self.max_diff_loss = max_diff_loss
-        self.patience = patience
-        self.min_critic_iter = min_critic_iter
+        self.max_diff_loss = max_diff_loss or 5.0
+        self.patience = patience or 5
+        self.min_critic_iter = min_critic_iter or 2
 
         if callable(critic_iterations):
             try:
@@ -101,17 +101,28 @@ class CriticIterations:
         return self.critic_iterations
 
     def __repr__(self):
+        tab = " " * 2
         to_return = self.__class__.__name__
         to_return += "("
-        to_return += f"critic_iterations={self.critic_iterations}, "
-        to_return += f"patience={self.patience}, "
-        to_return += f"k={self.k}, "
-        to_return += f"max_diff_loss={self.max_diff_loss}, "
-        to_return += f"diff_loss={self.diff_loss:.4f}, "
-        to_return += f"last_loss={self.last_loss:.4f}, "
-        to_return += f"new_loss={self.new_loss:.4f}, "
-        to_return += f"max_loss={self.max_loss:.4f}"
-        to_return += ")"
+        if callable(self.critic_iterations):
+            to_return += f"critic_iterations={self.critic_iterations}"
+            to_return += ")"
+        else:
+            to_return += f"\n{tab}" + f"critic_iterations={self.critic_iterations}, "
+            to_return += (
+                f"\n{tab}"
+                + f"last_loss={self.last_loss:.4f}, "
+                + f"new_loss={self.new_loss:.4f}, "
+            )
+            to_return += f"\n{tab}" + f"patience={self.patience}, " + f"k={self.k}, "
+            to_return += (
+                f"\n{tab}"
+                + f"max_loss={self.max_loss:.4f}, "
+                + f"diff_loss={self.diff_loss:.4f}, "
+                + f"max_diff_loss={self.max_diff_loss}, "
+            )
+            to_return = to_return.rstrip(", ")
+            to_return += "\n)"
 
         return to_return
 
@@ -599,7 +610,7 @@ def train_wgan_and_wae_optimized(
     image_size=64,
     num_epochs=100,
     critic_iterations=5,
-    crit_iter_patience=2,
+    crit_iter_patience=None,
     penalty_wgan_lp=10,
     penalty_wgan_gp=0.05,
     penalty_wae=10,
@@ -663,6 +674,10 @@ def train_wgan_and_wae_optimized(
         C = Critic(channels_img).to(device)
         E = Encoder(latent_dim, channels_img).to(device)
 
+    noise_sampler = LatentDistribution(
+        name=G.latent_distr_name, z_dim=latent_dim, device=device
+    )
+
     print(C)
     print(G)
     print(E)
@@ -698,7 +713,8 @@ def train_wgan_and_wae_optimized(
     )
 
     # for tensorboard plotting
-    fixed_noise = G.sample_noise(32)
+    fixed_noise = noise_sampler(32)
+    # fixed_noise = G.sample_noise(32)
     summary_writer_dir = Path(summary_writer_dir)
     summary_writer_dir.mkdir(exist_ok=True, parents=True)
     writer_real = SummaryWriter(summary_writer_dir / "real")
@@ -708,7 +724,6 @@ def train_wgan_and_wae_optimized(
 
     # Directory to save
     save_dir = Path(save_dir)
-    print(f"{save_dir = }")
     save_dir.mkdir(exist_ok=True, parents=True)
 
     # Schedulers
@@ -732,10 +747,14 @@ def train_wgan_and_wae_optimized(
 
     real_val, _ = next(iter(val_data_loader))
     real_val = real_val.to(device)
-    fixed_noise = fixed_noise.to(device)
+    # fixed_noise = fixed_noise.to(device)
     _penalty_wgan_gp = math.sqrt(
         penalty_wgan_gp / penalty_wgan_lp
     )  # the penalty that use the leaky relu
+
+    print(critic_iterations)
+    print(noise_sampler)
+    print(f"{save_dir = }")
 
     for epoch in range(1, num_epochs + 1):
         # Free memory
@@ -776,8 +795,9 @@ def train_wgan_and_wae_optimized(
             n_critic_iterations = critic_iterations(epoch)
             for _ in range(n_critic_iterations):
                 # Train Critic: min E[critic(fake)] - E[critic(real)] + penalization
+                z = noise_sampler(n)
                 with torch.cuda.amp.autocast():
-                    z = G.sample_noise(n, type_as=real)
+                    # z = G.sample_noise(n, type_as=real)
                     fake = G(z)
                     c_real = C(real).reshape(-1)
                     c_fake = C(fake).reshape(-1)
@@ -806,8 +826,9 @@ def train_wgan_and_wae_optimized(
                 C_scaler.update()
 
             # Train Generator: min Wasserstein distance
+            z = noise_sampler(n)
             with torch.cuda.amp.autocast():
-                z = G.sample_noise(n, type_as=real)
+                # z = G.sample_noise(n, type_as=real)
                 G_loss = -torch.mean(C(G(z)))  # Generator loss
                 wasserstein_dist_WGAN_ = torch.mean(C(real)) + G_loss
                 wasserstein_dist_WAE_ = criterion(real, G(E(real)))
@@ -830,8 +851,9 @@ def train_wgan_and_wae_optimized(
 
             # for _ in range(critic_iterations):
             # Train encoder: min |real - generator(encoder(real))| + penalization
+            z = noise_sampler(n)
             with torch.cuda.amp.autocast():
-                z = G.sample_noise(n, type_as=real)
+                # z = G.sample_noise(n, type_as=real)
                 z_tilde = E(real)  # Generate \tilde{z}_i from Q(Z|x_i) for i = 1:n
                 x_recon = G(z_tilde)
 
@@ -980,7 +1002,8 @@ def train_wgan_and_wae_optimized(
                 epoch_wass_dist_WAE_val.append(loss.data.item())
 
                 # WGAN Validation Loss
-                z = G.sample_noise(n, type_as=real)
+                z = noise_sampler(n)
+                # z = G.sample_noise(n, type_as=real)
                 fake = G(z)
                 c_real, c_fake = C(real).reshape(-1), C(fake).reshape(-1)
                 loss = torch.mean(c_real) - torch.mean(c_fake)
@@ -2222,7 +2245,7 @@ if __name__ == "__main__":
         milestones=MILESTONES,
         criterion=CRITERION,
         critic_iterations=5,
-        crit_iter_patience=3,
+        # crit_iter_patience=3,
         patience=50,
     )
 
