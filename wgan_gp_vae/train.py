@@ -37,16 +37,23 @@ torch.backends.cudnn.benchmark = True
 
 
 class CriticIterations:
-    def __init__(self, critic_iterations, patience=2):
+    def __init__(
+        self, critic_iterations, patience=5, max_diff_loss=5.0, min_critic_iter=2
+    ):
         self.k = 0
         self.last_loss = -float("inf")
+        self.max_loss = -float("inf")
         self.new_loss = -float("inf")
+        self.diff_loss = -float("inf")
+        self.max_diff_loss = max_diff_loss
         self.patience = patience
+        self.min_critic_iter = min_critic_iter
 
         if callable(critic_iterations):
             try:
                 _critic_iterations = critic_iterations
                 critic_iterations(19, 1.0)
+
             except TypeError:
 
                 def _critic_iterations(epoch, *args, **kwargs):
@@ -57,19 +64,34 @@ class CriticIterations:
             self.critic_iterations = critic_iterations
 
     def register_new_loss(self, new_loss):
+        if new_loss > self.max_loss:
+            self.max_loss = new_loss
+        self.diff_loss = self.max_loss - new_loss
         self.last_loss = self.new_loss
         self.new_loss = new_loss
 
-        if callable(self.critic_iterations):
+        if (
+            callable(self.critic_iterations)
+            or self.critic_iterations <= self.min_critic_iter
+        ):
             return
 
+        # If the difference is greater than the max_diff_loss, then decrease the critic_iterations
+        decrese_by_difference = self.diff_loss > self.max_diff_loss
+        if decrese_by_difference:
+            self.max_loss = new_loss
+
+        # If the new loss is less than the last loss, then increase the k
         if self.new_loss < self.last_loss:
             self.k += 1
         else:
             self.k = 0
 
-        if self.k >= self.patience:
-            self.critic_iterations = max(2, self.critic_iterations - 1)
+        # If the k is greater than the patience, or the difference is greater than the max_diff_loss, then decrease the critic_iterations
+        if self.k >= self.patience or decrese_by_difference:
+            self.critic_iterations = max(
+                self.min_critic_iter, self.critic_iterations - 1
+            )
             self.k = 0
 
     def __call__(self, epoch):
@@ -79,7 +101,19 @@ class CriticIterations:
         return self.critic_iterations
 
     def __repr__(self):
-        return f"CriticIterations(critic_iterations={self.critic_iterations}, patience={self.patience}, k={self.k}, last_loss={self.last_loss:.4f}, new_loss={self.new_loss:.4f})"
+        to_return = self.__class__.__name__
+        to_return += "("
+        to_return += f"critic_iterations={self.critic_iterations}, "
+        to_return += f"patience={self.patience}, "
+        to_return += f"k={self.k}, "
+        to_return += f"max_diff_loss={self.max_diff_loss}, "
+        to_return += f"diff_loss={self.diff_loss:.4f}, "
+        to_return += f"last_loss={self.last_loss:.4f}, "
+        to_return += f"new_loss={self.new_loss:.4f}, "
+        to_return += f"max_loss={self.max_loss:.4f}"
+        to_return += ")"
+
+        return to_return
 
 
 def sample_noise(n_dim, z_dim, device="cpu"):
@@ -116,7 +150,11 @@ def get_dataset(file_path: str, transform):
         )
         path_dataset = Path("dataset")
         dataset_.data = np.load(
-            path_dataset / "cleaned" / "data_sin_contorno_arriba.npy"
+            path_dataset
+            / "cleaned"
+            / "data.npy"
+            # path_dataset / "cleaned" / "data_sin_contorno.npy"
+            # path_dataset / "cleaned" / "data_sin_contorno_arriba.npy"
         ).reshape(-1, 28, 28)
         dataset_.targets = np.ones(len(dataset_.data), dtype=int)
         dataset = dataset_.get_train_data()
@@ -148,7 +186,7 @@ def train_wgan_and_wae(
     num_epochs=100,
     critic_iterations=5,
     penalty_wgan_lp=10,
-    penalty_wgan_gp=0.05,
+    penalty_wgan_gp=0.1,
     penalty_wae=10,
     criterion: Literal["mse", "l1"] = "l1",
     betas_wgan=(0.5, 0.9),
@@ -308,7 +346,7 @@ def train_wgan_and_wae(
 
             for _ in range(critic_iterations):
                 # Train Critic: min E[critic(fake)] - E[critic(real)] + penalization
-                z = G.sample_noise(n)
+                z = G.sample_noise(n, type_as=real)
                 fake = G(z)
                 c_real = C(real).reshape(-1)
                 c_fake = C(fake).reshape(-1)
@@ -325,7 +363,7 @@ def train_wgan_and_wae(
 
             for _ in range(critic_iterations):
                 # Train encoder: min |real - generator(encoder(real))| + penalization
-                z = G.sample_noise(n)
+                z = G.sample_noise(n, type_as=real)
                 z_tilde = E(real)  # Generate \tilde{z}_i from Q(Z|x_i) for i = 1:n
                 x_recon = G(z_tilde)
 
@@ -342,7 +380,7 @@ def train_wgan_and_wae(
                 E_optimizer.step()
 
             # Train Generator: min Wasserstein distance
-            z = G.sample_noise(n)
+            z = G.sample_noise(n, type_as=real)
             wasserstein_dist_WGAN_ = torch.mean(C(real)) - torch.mean(C(G(z)))
             wasserstein_dist_WAE_ = criterion(real, G(E(real)))
             G_loss = wasserstein_dist_WGAN_ + wasserstein_dist_WAE_
@@ -464,7 +502,7 @@ def train_wgan_and_wae(
                 epoch_wass_dist_WAE_val.append(loss.data.item())
 
                 # WGAN Validation Loss
-                z = G.sample_noise(n)
+                z = G.sample_noise(n, type_as=real)
                 fake = G(z)
                 c_real, c_fake = C(real).reshape(-1), C(fake).reshape(-1)
                 loss = torch.mean(c_real) - torch.mean(c_fake)
@@ -694,6 +732,7 @@ def train_wgan_and_wae_optimized(
 
     real_val, _ = next(iter(val_data_loader))
     real_val = real_val.to(device)
+    fixed_noise = fixed_noise.to(device)
     _penalty_wgan_gp = math.sqrt(
         penalty_wgan_gp / penalty_wgan_lp
     )  # the penalty that use the leaky relu
@@ -738,7 +777,7 @@ def train_wgan_and_wae_optimized(
             for _ in range(n_critic_iterations):
                 # Train Critic: min E[critic(fake)] - E[critic(real)] + penalization
                 with torch.cuda.amp.autocast():
-                    z = G.sample_noise(n)
+                    z = G.sample_noise(n, type_as=real)
                     fake = G(z)
                     c_real = C(real).reshape(-1)
                     c_fake = C(fake).reshape(-1)
@@ -747,7 +786,7 @@ def train_wgan_and_wae_optimized(
                     )
                     wasserstein_dist_WGAN = torch.mean(c_real) - torch.mean(c_fake)
                     C_loss = -wasserstein_dist_WGAN + penalty_wgan_lp * gradient
-                # z = G.sample_noise(n)
+                # z = G.sample_noise(n, type_as=real)
                 # fake = G(z)
                 # c_real = C(real).reshape(-1)
                 # c_fake = C(fake).reshape(-1)
@@ -768,14 +807,14 @@ def train_wgan_and_wae_optimized(
 
             # Train Generator: min Wasserstein distance
             with torch.cuda.amp.autocast():
-                z = G.sample_noise(n)
+                z = G.sample_noise(n, type_as=real)
                 G_loss = -torch.mean(C(G(z)))  # Generator loss
                 wasserstein_dist_WGAN_ = torch.mean(C(real)) + G_loss
                 wasserstein_dist_WAE_ = criterion(real, G(E(real)))
                 G_loss_ = wasserstein_dist_WGAN_ + wasserstein_dist_WAE_
 
             # # Train Generator: min Wasserstein distance
-            # z = G.sample_noise(n)
+            # z = G.sample_noise(n, type_as=real)
             # wasserstein_dist_WGAN_ = torch.mean(C(real)) - torch.mean(C(G(z)))
             # wasserstein_dist_WAE_ = criterion(real, G(E(real)))
             # G_loss = wasserstein_dist_WGAN_ + wasserstein_dist_WAE_
@@ -792,19 +831,19 @@ def train_wgan_and_wae_optimized(
             # for _ in range(critic_iterations):
             # Train encoder: min |real - generator(encoder(real))| + penalization
             with torch.cuda.amp.autocast():
-                z = G.sample_noise(n)
+                z = G.sample_noise(n, type_as=real)
                 z_tilde = E(real)  # Generate \tilde{z}_i from Q(Z|x_i) for i = 1:n
                 x_recon = G(z_tilde)
 
                 # According to the paper, this is the Wasserstein distance
                 wasserstein_dist_WAE = criterion(real, x_recon)
                 mmd_loss = imq_kernel(
-                    z, z_tilde, p_distr=G.latent_distr.name
+                    z, z_tilde, p_distr=G.latent_distr_name
                 )  # Compute MMD
                 E_loss = wasserstein_dist_WAE + penalty_wae * mmd_loss
 
             # # Train encoder: min |real - generator(encoder(real))| + penalization
-            # z = G.sample_noise(n)
+            # z = G.sample_noise(n, type_as=real)
             # z_tilde = E(real)  # Generate \tilde{z}_i from Q(Z|x_i) for i = 1:n
             # x_recon = G(z_tilde)
 
@@ -941,7 +980,7 @@ def train_wgan_and_wae_optimized(
                 epoch_wass_dist_WAE_val.append(loss.data.item())
 
                 # WGAN Validation Loss
-                z = G.sample_noise(n)
+                z = G.sample_noise(n, type_as=real)
                 fake = G(z)
                 c_real, c_fake = C(real).reshape(-1), C(fake).reshape(-1)
                 loss = torch.mean(c_real) - torch.mean(c_fake)
@@ -1204,7 +1243,7 @@ def train_wgan_and_wae_optimized(
 #             # Train Critic: max E[critic(real)] - E[critic(fake)]
 #             # equivalent to minimizing the negative of that
 #             for _ in range(critic_iterations):
-#                 noise = G.sample_noise(n)
+#                 noise = G.sample_noise(n, type_as=real)
 #                 fake = G(noise)
 #                 c_real = C(real).reshape(-1)
 #                 c_fake = C(fake).reshape(-1)
@@ -1226,7 +1265,7 @@ def train_wgan_and_wae_optimized(
 
 #             # Train Encoder + Generator
 #             # generate noise
-#             z = G.sample_noise(n)  # Generate {z_1, ..., z_n} from the prior P_z
+#             z = G.sample_noise(n, type_as=real)  # Generate {z_1, ..., z_n} from the prior P_z
 #             z_tilde = E(real)  # Generate \tilde{z}_i from Q(Z|x_i) for i = 1:n
 #             x_recon = G(z_tilde)
 
@@ -1357,7 +1396,7 @@ def train_wgan_and_wae_optimized(
 #                 epoch_wass_dist_WAE_val.append(loss.data.item())
 
 #                 # WGAN Validation Loss
-#                 noise = G.sample_noise(n)
+#                 noise = G.sample_noise(n, type_as=real)
 #                 fake = G(noise)
 #                 c_real, c_fake = C(real).reshape(-1), C(fake).reshape(-1)
 #                 loss = torch.mean(c_real) - torch.mean(c_fake)
@@ -1828,7 +1867,9 @@ def train_encoder_with_wae(
             n = real.shape[0]
 
             # generate noise
-            z = G.sample_noise(n)  # Generate {z_1, ..., z_n} from the prior P_z
+            z = G.sample_noise(
+                n, type_as=real
+            )  # Generate {z_1, ..., z_n} from the prior P_z
             z_tilde = E(real)  # Generate \tilde{z}_i from Q(Z|x_i) for i = 1:n
             x_recon = G(z_tilde)
 
@@ -2157,16 +2198,9 @@ if __name__ == "__main__":
         "generator": dict(Block=ResidualBlock, latent_distr=NOISE_NAME),
         "critic": dict(Block=ResidualBlock),
     }
-    NAME_DIR = f"_resnet_face_zDim{LATENT_DIM}_{NOISE_NAME}_bs_{BATCH_SIZE}_cleaned_sin_contorno_arriba_augmented_WAE_WGAN_loss_{CRITERION}_{size_x}p{size_y}"
+    NAME_DIR = f"_resnet_face_zDim{LATENT_DIM}_{NOISE_NAME}_bs_{BATCH_SIZE}_cleaned_augmented_WAE_WGAN_loss_{CRITERION}_{size_x}p{size_y}"
     SAVE_DIR = Path("networks") / NAME_DIR
     SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
-
-    def CRITIC_ITERATIONS(epoch):
-        if epoch <= 10:
-            return 5
-        elif epoch <= 40:
-            return 3
-        return 2
 
     train_wgan_and_wae_optimized(
         nn_kwargs=NN_KWARGS,
@@ -2187,10 +2221,9 @@ if __name__ == "__main__":
         report_every=REPORT_EVERY,
         milestones=MILESTONES,
         criterion=CRITERION,
-        critic_iterations=7,
-        crit_iter_patience=5,
+        critic_iterations=5,
+        crit_iter_patience=3,
         patience=50,
-        # critic_iterations=CRITIC_ITERATIONS,
     )
 
     # LATENT_DIM = 64
