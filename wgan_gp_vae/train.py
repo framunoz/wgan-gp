@@ -6,6 +6,7 @@ from torchvision import disable_beta_transforms_warning
 disable_beta_transforms_warning()
 
 import os
+from copy import deepcopy
 from pathlib import Path
 from typing import Literal
 
@@ -38,7 +39,7 @@ torch.backends.cudnn.benchmark = True
 
 class CriticIterations:
     def __init__(
-        self, critic_iterations, patience=5, max_diff_loss=5.0, min_critic_iter=2
+        self, critic_iterations, patience=5, max_diff_loss=10.0, min_critic_iter=2
     ):
         self.k = 0
         self.last_loss = -float("inf")
@@ -108,13 +109,17 @@ class CriticIterations:
             to_return += f"critic_iterations={self.critic_iterations}"
             to_return += ")"
         else:
-            to_return += f"\n{tab}" + f"critic_iterations={self.critic_iterations}, "
+            to_return += (
+                f"\n{tab}"
+                + f"critic_iterations={self.critic_iterations}, "
+                + f"min_critic_iter={self.min_critic_iter}, "
+            )
             to_return += (
                 f"\n{tab}"
                 + f"last_loss={self.last_loss:.4f}, "
                 + f"new_loss={self.new_loss:.4f}, "
             )
-            to_return += f"\n{tab}" + f"patience={self.patience}, " + f"k={self.k}, "
+            to_return += f"\n{tab}" + f"k={self.k}, " + f"patience={self.patience}, "
             to_return += (
                 f"\n{tab}"
                 + f"max_loss={self.max_loss:.4f}, "
@@ -756,6 +761,11 @@ def train_wgan_and_wae_optimized(
     print(noise_sampler)
     print(f"{save_dir = }")
 
+    mov_avg_critic_val = None  # Moving average of the critic values
+    time_window = 5  # Time window for the moving average
+    smth_fact = 2 / (time_window + 1)  # Smoothing factor for the moving average
+    print(f"{time_window = }; smoothing factor = {smth_fact:.6f}")
+
     for epoch in range(1, num_epochs + 1):
         # Free memory
         torch.cuda.empty_cache()
@@ -767,6 +777,8 @@ def train_wgan_and_wae_optimized(
         E_epoch_losses = []
         critic_real_values = []
         critic_fake_values = []
+        critic_mean_values = []
+        mov_avg_critic_vals = []
         gradient_norm_values = []
 
         if verbose:
@@ -830,9 +842,9 @@ def train_wgan_and_wae_optimized(
             with torch.cuda.amp.autocast():
                 # z = G.sample_noise(n, type_as=real)
                 G_loss = -torch.mean(C(G(z)))  # Generator loss
-                wasserstein_dist_WGAN_ = torch.mean(C(real)) + G_loss
-                wasserstein_dist_WAE_ = criterion(real, G(E(real)))
-                G_loss_ = wasserstein_dist_WGAN_ + wasserstein_dist_WAE_
+                # wasserstein_dist_WGAN_ = torch.mean(C(real)) + G_loss
+                # wasserstein_dist_WAE_ = criterion(real, G(E(real)))
+                # G_loss_ = wasserstein_dist_WGAN_ + wasserstein_dist_WAE_
 
             # # Train Generator: min Wasserstein distance
             # z = G.sample_noise(n, type_as=real)
@@ -897,15 +909,27 @@ def train_wgan_and_wae_optimized(
                 C_epoch_losses.append(C_loss.data.item())
                 G_epoch_losses.append(G_loss.data.item())
                 E_epoch_losses.append(E_loss.data.item())
-                critic_real_value = torch.mean(c_real)
-                critic_fake_value = torch.mean(c_fake)
-                critic_real_values.append(critic_real_value.data.item())
-                critic_fake_values.append(critic_fake_value.data.item())
+
+                critic_real_value = c_real.mean().data.item()
+                critic_fake_value = c_fake.mean().data.item()
+
+                mean_critic_value = (critic_real_value + critic_fake_value) / 2
+                if mov_avg_critic_val is None:
+                    mov_avg_critic_val = mean_critic_value
+                else:
+                    mov_avg_critic_val = (
+                        smth_fact * mean_critic_value
+                        + (1 - smth_fact) * mov_avg_critic_val
+                    )
+
+                critic_real_values.append(critic_real_value)
+                critic_fake_values.append(critic_fake_value)
+                critic_mean_values.append(mean_critic_value)
+                mov_avg_critic_vals.append(mov_avg_critic_val)
+
                 gradient_norm_mean = torch.mean(gradient_norm)
                 gradient_norm_values.append(gradient_norm_mean.data.item())
 
-            # Print losses occasionally and print to tensorboard
-            if batch_idx % report_every == 0:
                 with torch.no_grad():
                     fake_WGAN = G(fixed_noise)
                     fake_WAE = G(E(real))
@@ -977,11 +1001,16 @@ def train_wgan_and_wae_optimized(
                         {
                             "Real": critic_real_value,
                             "Fake": critic_fake_value,
+                            "Mean": mean_critic_value,
+                            "Mov. Avg.": mov_avg_critic_val,
                         },
                         global_step=step,
                     )
 
                 step += 1
+
+        # Register the average loss
+        critic_iterations.register_new_loss(mov_avg_critic_val)
 
         # Validation loop
         if verbose:
@@ -1021,9 +1050,9 @@ def train_wgan_and_wae_optimized(
             best_validation_loss = avg_wass_dist_WAE_val
             current_patience = 0
             # Save models
-            torch.save(G.state_dict(), save_dir / "generator")
-            torch.save(C.state_dict(), save_dir / "discriminator")
-            torch.save(E.state_dict(), save_dir / "encoder")
+            torch.save(deepcopy(G.state_dict()), save_dir / "generator.pt")
+            torch.save(deepcopy(C.state_dict()), save_dir / "discriminator.pt")
+            torch.save(deepcopy(E.state_dict()), save_dir / "encoder.pt")
         else:
             current_patience += 1
 
@@ -1035,9 +1064,10 @@ def train_wgan_and_wae_optimized(
         E_avg_loss = torch.mean(torch.FloatTensor(E_epoch_losses)).item()
         critic_real_avg_loss = torch.mean(torch.FloatTensor(critic_real_values)).item()
         critic_fake_avg_loss = torch.mean(torch.FloatTensor(critic_fake_values)).item()
-        critic_iterations.register_new_loss(
-            (critic_real_avg_loss + critic_fake_avg_loss) / 2
-        )
+        critic_mean_avg_loss = torch.mean(torch.FloatTensor(critic_mean_values)).item()
+        mov_avg_critic_val_avg = torch.mean(
+            torch.FloatTensor(mov_avg_critic_vals)
+        ).item()
         print(f"{critic_iterations = }")
         gradient_norm_values_avg = torch.mean(
             torch.FloatTensor(gradient_norm_values)
@@ -1068,7 +1098,12 @@ def train_wgan_and_wae_optimized(
         )
         writer_loss.add_scalars(
             critic_values_name,
-            {"Avg. Real": critic_real_avg_loss, "Avg. Fake": critic_fake_avg_loss},
+            {
+                "Avg. Real": critic_real_avg_loss,
+                "Avg. Fake": critic_fake_avg_loss,
+                "Avg. Mean": critic_mean_avg_loss,
+                "Avg. Mov. Avg.": mov_avg_critic_val_avg,
+            },
             global_epoch,
         )
         writer_loss.add_scalars(
@@ -2190,7 +2225,7 @@ if __name__ == "__main__":
     CRITERION = "l1"
     CHANNELS_IMG = 1
     BATCH_SIZE = 128
-    NUM_EPOCHS = 100
+    NUM_EPOCHS = 10
     REPORT_EVERY = 10
     # FILE_PATH = "/home/fmunoz/codeProjects/pythonProjects/wgan-gp/dataset/quick_draw/face_recognized.npy"
     # FILE_PATH = (

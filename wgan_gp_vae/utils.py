@@ -82,11 +82,20 @@ def load_checkpoint(
 ):
     if type_model not in _models_option:
         raise ValueError(f"Choose one of the options: {_models_option}.")
-    source_path = Path(root_path) / type_model
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model.load_state_dict(torch.load(source_path, map_location=device))
+    try:
+        source_path = Path(root_path) / type_model
+        model.load_state_dict(torch.load(source_path, map_location=device))
+    except:
+        try:
+            source_path = Path(root_path) / f"{type_model}.pt"
+            model.load_state_dict(torch.load(source_path, map_location=device))
+        except:
+            raise FileNotFoundError(
+                f"File not found in {source_path} or {source_path}.pt"
+            )
     model.eval()
 
     return model
