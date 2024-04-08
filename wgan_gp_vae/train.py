@@ -796,10 +796,6 @@ def train_wgan_and_wae_optimized(
         G_optimizer.zero_grad(set_to_none=True)
         E_optimizer.zero_grad(set_to_none=True)
 
-        # Scalers
-        C_scaler = torch.cuda.amp.GradScaler()
-        G_scaler = torch.cuda.amp.GradScaler()
-        E_scaler = torch.cuda.amp.GradScaler()
         for batch_idx, (real, _) in iterable:
             n = real.shape[0]
             real = real.to(device, non_blocking=True)
@@ -808,97 +804,47 @@ def train_wgan_and_wae_optimized(
             for _ in range(n_critic_iterations):
                 # Train Critic: min E[critic(fake)] - E[critic(real)] + penalization
                 z = noise_sampler(n)
-                with torch.cuda.amp.autocast():
-                    # z = G.sample_noise(n, type_as=real)
-                    fake = G(z)
-                    c_real = C(real).reshape(-1)
-                    c_fake = C(fake).reshape(-1)
-                    gradient, gradient_norm = gradient_penalty(
-                        C, real, fake, device=device, penalty_gr=_penalty_wgan_gp
-                    )
-                    wasserstein_dist_WGAN = torch.mean(c_real) - torch.mean(c_fake)
-                    C_loss = -wasserstein_dist_WGAN + penalty_wgan_lp * gradient
-                # z = G.sample_noise(n, type_as=real)
-                # fake = G(z)
-                # c_real = C(real).reshape(-1)
-                # c_fake = C(fake).reshape(-1)
-                # gradient, gradient_norm = utils.gradient_penalty_improved(
-                #     C, real, fake, device=device, penalty_gr=_penalty_wgan_gp
-                # )
-                # wasserstein_dist_WGAN = torch.mean(c_real) - torch.mean(c_fake)
-                # C_loss = -wasserstein_dist_WGAN + penalty_wgan_lp * gradient
-
-                # Update parameters of the critic
-                # C.zero_grad(set_to_none=True)
-                # C_loss.backward(retain_graph=True)
-                # C_optimizer.step()
+                fake = G(z)
+                c_real = C(real).reshape(-1)
+                c_fake = C(fake).reshape(-1)
+                gradient, gradient_norm = gradient_penalty(
+                    C, real, fake, device=device, penalty_gr=_penalty_wgan_gp
+                )
+                wasserstein_dist_WGAN = torch.mean(c_real) - torch.mean(c_fake)
+                C_loss = -wasserstein_dist_WGAN + penalty_wgan_lp * gradient
+                
                 C_optimizer.zero_grad(set_to_none=True)
-                C_scaler.scale(C_loss).backward(retain_graph=True)
-                C_scaler.step(C_optimizer)
-                C_scaler.update()
+                C_loss.backward(retain_graph=True)
+                C_optimizer.step()
 
             # Train Generator: min Wasserstein distance
             z = noise_sampler(n)
-            with torch.cuda.amp.autocast():
-                # z = G.sample_noise(n, type_as=real)
-                G_loss = -torch.mean(C(G(z)))  # Generator loss
-                # wasserstein_dist_WGAN_ = torch.mean(C(real)) + G_loss
-                # wasserstein_dist_WAE_ = criterion(real, G(E(real)))
-                # G_loss_ = wasserstein_dist_WGAN_ + wasserstein_dist_WAE_
-
-            # # Train Generator: min Wasserstein distance
-            # z = G.sample_noise(n, type_as=real)
-            # wasserstein_dist_WGAN_ = torch.mean(C(real)) - torch.mean(C(G(z)))
-            # wasserstein_dist_WAE_ = criterion(real, G(E(real)))
-            # G_loss = wasserstein_dist_WGAN_ + wasserstein_dist_WAE_
+            G_loss = -torch.mean(C(G(z)))  # Generator loss
+            
 
             # Update parameters of the generator
-            # G.zero_grad(set_to_none=True)
-            # G_loss.backward()
-            # G_optimizer.step()
             G_optimizer.zero_grad(set_to_none=True)
-            G_scaler.scale(G_loss).backward()
-            G_scaler.step(G_optimizer)
-            G_scaler.update()
+            G_loss.backward()
+            G_optimizer.step()
 
-            # for _ in range(critic_iterations):
             # Train encoder: min |real - generator(encoder(real))| + penalization
             z = noise_sampler(n)
-            with torch.cuda.amp.autocast():
-                # z = G.sample_noise(n, type_as=real)
-                z_tilde = E(real)  # Generate \tilde{z}_i from Q(Z|x_i) for i = 1:n
-                x_recon = G(z_tilde)
+            z_tilde = E(real)  # Generate \tilde{z}_i from Q(Z|x_i) for i = 1:n
+            x_recon = G(z_tilde)
 
-                # According to the paper, this is the Wasserstein distance
-                wasserstein_dist_WAE = criterion(real, x_recon)
-                mmd_loss = imq_kernel(
-                    z, z_tilde, p_distr=G.latent_distr_name
-                )  # Compute MMD
-                E_loss = wasserstein_dist_WAE + penalty_wae * mmd_loss
-
-            # # Train encoder: min |real - generator(encoder(real))| + penalization
-            # z = G.sample_noise(n, type_as=real)
-            # z_tilde = E(real)  # Generate \tilde{z}_i from Q(Z|x_i) for i = 1:n
-            # x_recon = G(z_tilde)
-
-            # # According to the paper, this is the Wasserstein distance
-            # wasserstein_dist_WAE = criterion(real, x_recon)
-            # mmd_loss = imq_kernel(
-            #     z, z_tilde, p_distr=G.latent_distr.name
-            # )  # Compute MMD
-            # E_loss = wasserstein_dist_WAE + penalty_wae * mmd_loss
+            # According to the paper, this is the Wasserstein distance
+            wasserstein_dist_WAE = criterion(real, x_recon)
+            mmd_loss = imq_kernel(
+                z, z_tilde, p_distr=G.latent_distr_name
+            )  # Compute MMD
+            E_loss = wasserstein_dist_WAE + penalty_wae * mmd_loss
 
             # Update parameters of the encoder
-            # E.zero_grad(set_to_none=True)
-            # E_loss.backward(retain_graph=True)
-            # E_optimizer.step()
             E_optimizer.zero_grad(set_to_none=True)
             G_optimizer.zero_grad(set_to_none=True)
-            E_scaler.scale(E_loss).backward()
-            E_scaler.step(E_optimizer)
-            G_scaler.step(G_optimizer)
-            E_scaler.update()
-            G_scaler.update()
+            E_loss.backward()
+            E_optimizer.step()
+            G_optimizer.step()
 
             # loss values
             # Register occasionally
@@ -914,13 +860,10 @@ def train_wgan_and_wae_optimized(
                 critic_fake_value = c_fake.mean().data.item()
 
                 mean_critic_value = (critic_real_value + critic_fake_value) / 2
-                if mov_avg_critic_val is None:
-                    mov_avg_critic_val = mean_critic_value
-                else:
-                    mov_avg_critic_val = (
-                        smth_fact * mean_critic_value
-                        + (1 - smth_fact) * mov_avg_critic_val
-                    )
+                mov_avg_critic_val = (
+                    smth_fact * mean_critic_value
+                    + (1 - smth_fact) * mov_avg_critic_val
+                ) if mov_avg_critic_val is not None else mean_critic_value
 
                 critic_real_values.append(critic_real_value)
                 critic_fake_values.append(critic_fake_value)
@@ -2256,7 +2199,7 @@ if __name__ == "__main__":
         "generator": dict(Block=ResidualBlock, latent_distr=NOISE_NAME),
         "critic": dict(Block=ResidualBlock),
     }
-    NAME_DIR = f"_resnet_face_zDim{LATENT_DIM}_{NOISE_NAME}_bs_{BATCH_SIZE}_cleaned_augmented_WAE_WGAN_loss_{CRITERION}_{size_x}p{size_y}"
+    NAME_DIR = f"cleaned_clustered_zDim{LATENT_DIM}_{NOISE_NAME}_bs_{BATCH_SIZE}"
     SAVE_DIR = Path("networks") / NAME_DIR
     SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
 
