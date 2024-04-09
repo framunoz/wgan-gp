@@ -1004,6 +1004,12 @@ def train_wgan_and_wae_optimized(
             torch.save(deepcopy(E.state_dict()), save_dir / "encoder.pt")
         else:
             current_patience += 1
+            # Save models
+            torch.save(deepcopy(G.state_dict()), save_dir / "generator_overfitted.pt")
+            torch.save(
+                deepcopy(C.state_dict()), save_dir / "discriminator_overfitted.pt"
+            )
+            torch.save(deepcopy(E.state_dict()), save_dir / "encoder_overfitted.pt")
 
         global_epoch = step - 1
         avg_wass_dist_WGAN = torch.mean(torch.FloatTensor(epoch_wass_dist_WGAN)).item()
@@ -2213,7 +2219,7 @@ if __name__ == "__main__":
     NAME_DIR = f"cleaned_{DATA_NAME}_zDim{LATENT_DIM}_{NOISE_NAME}_bs_{BATCH_SIZE}"
     SAVE_DIR = Path("networks") / NAME_DIR
     SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
-    NUM_EPOCHS = 100
+    NUM_EPOCHS = 900
     train_wgan_and_wae_optimized(
         nn_kwargs=NN_KWARGS,
         latent_dim=LATENT_DIM,
@@ -2231,12 +2237,12 @@ if __name__ == "__main__":
         save_dir=SAVE_DIR,
         summary_writer_dir=SUMMARY_WRITER_DIR,
         transform=TRANSFORM,
-        report_every=REPORT_EVERY,
+        report_every=2,
         milestones=MILESTONES,
         criterion=CRITERION,
         critic_iterations=5,
         # crit_iter_patience=3,
-        patience=50,
+        patience=400,
     )
 
     # data sin contorno
