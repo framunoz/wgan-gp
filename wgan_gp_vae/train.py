@@ -146,15 +146,15 @@ def get_device(device=None) -> torch.device:
     return device
 
 
-def get_dataset(file_path: str, transform):
+def get_dataset(transform, ds_type: str, file_path: str = None):
     dataset = None
     test_dataset = None
 
-    if file_path == "mnist":
+    if ds_type == "mnist":
         dataset = datasets.MNIST(root="dataset/", transform=transform, download=True)
-    elif file_path == "celeba":
+    elif ds_type == "celeba":
         dataset = datasets.ImageFolder(root="celeb_dataset", transform=transform)
-    elif file_path == "quickdraw":
+    elif ds_type == "quickdraw":
         categories = [qt.Category.FACE]
         dataset_ = qt.QuickDraw(
             root="dataset",
@@ -164,11 +164,11 @@ def get_dataset(file_path: str, transform):
             recognized=True,
             train_percentage=0.95,
         )
-        path_dataset = Path("dataset")
+        path_dataset = Path(file_path)
         dataset_.data = np.load(
             path_dataset
-            / "cleaned"
-            / "data.npy"
+            # / "cleaned"
+            # / "data.npy"
             # path_dataset / "cleaned" / "data_sin_contorno.npy"
             # path_dataset / "cleaned" / "data_sin_contorno_arriba.npy"
         ).reshape(-1, 28, 28)
@@ -628,7 +628,8 @@ def train_wgan_and_wae_optimized(
     min_delta=0,  # Minimum change in validation loss to be considered as an improvement
     device=None,
     transform=None,
-    file_path: str | Literal["mnist", "celeba"] = "shoes_images/shoes.hdf5",
+    file_path: str = None,
+    ds_type="quickdraw",
     save_dir="networks/",
     summary_writer_dir="logs",
     verbose=True,
@@ -650,7 +651,9 @@ def train_wgan_and_wae_optimized(
     )
 
     # Dataset and Dataloader
-    dataset, val_dataset = get_dataset(file_path=file_path, transform=transform)
+    dataset, val_dataset = get_dataset(
+        ds_type=ds_type, file_path=file_path, transform=transform
+    )
 
     data_loader = DataLoader(
         dataset,
@@ -762,7 +765,7 @@ def train_wgan_and_wae_optimized(
     print(f"{save_dir = }")
 
     mov_avg_critic_val = None  # Moving average of the critic values
-    time_window = 5  # Time window for the moving average
+    time_window = 10  # Time window for the moving average
     smth_fact = 2 / (time_window + 1)  # Smoothing factor for the moving average
     print(f"{time_window = }; smoothing factor = {smth_fact:.6f}")
 
@@ -812,7 +815,7 @@ def train_wgan_and_wae_optimized(
                 )
                 wasserstein_dist_WGAN = torch.mean(c_real) - torch.mean(c_fake)
                 C_loss = -wasserstein_dist_WGAN + penalty_wgan_lp * gradient
-                
+
                 C_optimizer.zero_grad(set_to_none=True)
                 C_loss.backward(retain_graph=True)
                 C_optimizer.step()
@@ -820,7 +823,6 @@ def train_wgan_and_wae_optimized(
             # Train Generator: min Wasserstein distance
             z = noise_sampler(n)
             G_loss = -torch.mean(C(G(z)))  # Generator loss
-            
 
             # Update parameters of the generator
             G_optimizer.zero_grad(set_to_none=True)
@@ -861,9 +863,13 @@ def train_wgan_and_wae_optimized(
 
                 mean_critic_value = (critic_real_value + critic_fake_value) / 2
                 mov_avg_critic_val = (
-                    smth_fact * mean_critic_value
-                    + (1 - smth_fact) * mov_avg_critic_val
-                ) if mov_avg_critic_val is not None else mean_critic_value
+                    (
+                        smth_fact * mean_critic_value
+                        + (1 - smth_fact) * mov_avg_critic_val
+                    )
+                    if mov_avg_critic_val is not None
+                    else mean_critic_value
+                )
 
                 critic_real_values.append(critic_real_value)
                 critic_fake_values.append(critic_fake_value)
@@ -2168,13 +2174,12 @@ if __name__ == "__main__":
     CRITERION = "l1"
     CHANNELS_IMG = 1
     BATCH_SIZE = 128
-    NUM_EPOCHS = 10
+    NUM_EPOCHS = 35
     REPORT_EVERY = 10
     # FILE_PATH = "/home/fmunoz/codeProjects/pythonProjects/wgan-gp/dataset/quick_draw/face_recognized.npy"
     # FILE_PATH = (
     #     "/home/fmunoz/codeProjects/pythonProjects/wgan-gp/dataset/cleaned/data.npy"
     # )
-    FILE_PATH = "quickdraw"
     TRANSFORM = T.Compose(
         [
             T.RandomHorizontalFlip(p=0.5),
@@ -2199,10 +2204,16 @@ if __name__ == "__main__":
         "generator": dict(Block=ResidualBlock, latent_distr=NOISE_NAME),
         "critic": dict(Block=ResidualBlock),
     }
-    NAME_DIR = f"cleaned_clustered_zDim{LATENT_DIM}_{NOISE_NAME}_bs_{BATCH_SIZE}"
+
+    DS_TYPE = "quickdraw"
+
+    # data sin contorno arriba
+    DATA_NAME = "data_sin_contorno_arriba"
+    DATA_PATH = Path("dataset") / "cleaned" / f"{DATA_NAME}.npy"
+    NAME_DIR = f"cleaned_{DATA_NAME}_zDim{LATENT_DIM}_{NOISE_NAME}_bs_{BATCH_SIZE}"
     SAVE_DIR = Path("networks") / NAME_DIR
     SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
-
+    NUM_EPOCHS = 100
     train_wgan_and_wae_optimized(
         nn_kwargs=NN_KWARGS,
         latent_dim=LATENT_DIM,
@@ -2215,7 +2226,72 @@ if __name__ == "__main__":
         betas_wae=(0.5, 0.9),
         batch_size=BATCH_SIZE,
         num_epochs=NUM_EPOCHS,
-        file_path=FILE_PATH,
+        file_path=DATA_PATH,
+        ds_type=DS_TYPE,
+        save_dir=SAVE_DIR,
+        summary_writer_dir=SUMMARY_WRITER_DIR,
+        transform=TRANSFORM,
+        report_every=REPORT_EVERY,
+        milestones=MILESTONES,
+        criterion=CRITERION,
+        critic_iterations=5,
+        # crit_iter_patience=3,
+        patience=50,
+    )
+
+    # data sin contorno
+    DATA_NAME = "data_sin_contorno"
+    DATA_PATH = Path("dataset") / "cleaned" / f"{DATA_NAME}.npy"
+    NAME_DIR = f"cleaned_{DATA_NAME}_zDim{LATENT_DIM}_{NOISE_NAME}_bs_{BATCH_SIZE}"
+    SAVE_DIR = Path("networks") / NAME_DIR
+    SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
+    NUM_EPOCHS = 50
+    train_wgan_and_wae_optimized(
+        nn_kwargs=NN_KWARGS,
+        latent_dim=LATENT_DIM,
+        channels_img=CHANNELS_IMG,
+        image_size=IMAGE_SIZE,
+        learning_rate_E=3e-4,
+        learning_rate_C=3e-4,
+        learning_rate_G=3e-4,
+        betas_wgan=(0.5, 0.9),
+        betas_wae=(0.5, 0.9),
+        batch_size=BATCH_SIZE,
+        num_epochs=NUM_EPOCHS,
+        file_path=DATA_PATH,
+        ds_type=DS_TYPE,
+        save_dir=SAVE_DIR,
+        summary_writer_dir=SUMMARY_WRITER_DIR,
+        transform=TRANSFORM,
+        report_every=REPORT_EVERY,
+        milestones=MILESTONES,
+        criterion=CRITERION,
+        critic_iterations=5,
+        # crit_iter_patience=3,
+        patience=50,
+    )
+
+    # data
+    DATA_NAME = "data"
+    DATA_PATH = Path("dataset") / "cleaned" / f"{DATA_NAME}.npy"
+    NAME_DIR = f"cleaned_{DATA_NAME}_zDim{LATENT_DIM}_{NOISE_NAME}_bs_{BATCH_SIZE}"
+    SAVE_DIR = Path("networks") / NAME_DIR
+    SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
+    NUM_EPOCHS = 35
+    train_wgan_and_wae_optimized(
+        nn_kwargs=NN_KWARGS,
+        latent_dim=LATENT_DIM,
+        channels_img=CHANNELS_IMG,
+        image_size=IMAGE_SIZE,
+        learning_rate_E=3e-4,
+        learning_rate_C=3e-4,
+        learning_rate_G=3e-4,
+        betas_wgan=(0.5, 0.9),
+        betas_wae=(0.5, 0.9),
+        batch_size=BATCH_SIZE,
+        num_epochs=NUM_EPOCHS,
+        file_path=DATA_PATH,
+        ds_type=DS_TYPE,
         save_dir=SAVE_DIR,
         summary_writer_dir=SUMMARY_WRITER_DIR,
         transform=TRANSFORM,
