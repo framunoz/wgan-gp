@@ -257,6 +257,7 @@ class ProjectorOnManifold:
             ]
         )
 
+    @torch.no_grad()
     def forward(self, x):
         x = self._transform_in(x).to(x.device)
         x = torch.unsqueeze(x, 0)
