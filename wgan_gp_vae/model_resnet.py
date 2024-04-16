@@ -1,6 +1,5 @@
 import abc
 import functools
-import math
 from typing import Callable, Iterable, Literal, Optional, Type
 
 import torch
@@ -328,19 +327,6 @@ class Generator(nn.Module):
             num_filters[-1], channels_img, kernel_size=3, padding=1
         )
         self.latent_distr_name: Literal["unif", "norm"] = latent_distr
-        # self._latent_distr = _LATENT_DISTR[latent_distr]
-
-    # @property
-    # def device(self) -> torch.device:
-    #     return next(self.parameters()).device
-
-    # @property
-    # def latent_distr(self) -> latent_distr:
-    #     if isinstance(self._latent_distr, str):
-    #         self._latent_distr = _LATENT_DISTR[self._latent_distr](
-    #             z_dim=self.latent_dim, device=self.device
-    #         )
-    #     return self._latent_distr
 
     def forward(self, x):
         x = self.upsample(x)
@@ -348,12 +334,6 @@ class Generator(nn.Module):
         x = self.conv_out(x)
         x = F.tanh(x)
         return x
-
-    # def sample_noise(self, n: int, type_as=None) -> torch.Tensor:
-    #     if type_as is None:
-    #         return self._latent_distr(z_dim=self.latent_dim)(n)
-    #     else:
-    #         return self._latent_distr(z_dim=self.latent_dim, device=type_as.device)(n)
 
 
 # critic model
