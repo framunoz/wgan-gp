@@ -3,14 +3,13 @@ import functools
 from typing import Callable, Iterable, Literal, Optional, Type
 
 import torch
-import torch.distributions as D
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.common_types import _size_2_t
 
 _norm_layer_t = Optional[Literal["instance_norm", "batch_norm"]]
 _device_t = str | torch.device
 _resample_t = Optional[Literal["up", "down"]]
+type seed_t = int | None
 
 
 class UpsampleConv2d(nn.Conv2d):
@@ -208,7 +207,27 @@ class ResidualBlockV2(ResidualBlock):
 _Block = ResidualBlock
 
 
+def set_generator(seed: seed_t = None, device: _device_t = "cpu") -> torch.Generator:
+    """
+    Set the generator for the random number generator.
+
+    :param seed: The seed for the random number generator.
+    :param device: The device to set the generator.
+    :return: The generator.
+    """
+    gen = torch.Generator(device=device)
+    if seed is None:
+        gen.seed()
+        return gen
+    gen.manual_seed(seed)
+    return gen
+
+
 class latent_distr(abc.ABC):
+    gen: torch.Generator
+    device: _device_t
+    dtype: torch.dtype
+
     @abc.abstractmethod
     def __call__(self, n_dim: int, device: _device_t = "cpu"):
         """Return a tensor of shape (n_dim, z_dim, 1, 1)"""
@@ -225,14 +244,29 @@ class latent_distr(abc.ABC):
 
 
 class unif(latent_distr):
-    def __init__(self, z_dim: int, device: _device_t, a: float = -1, b: float = 1):
+    def __init__(
+        self,
+        z_dim: int,
+        device: _device_t,
+        dtype: torch.dtype = torch.float32,
+        a: float = -1,
+        b: float = 1,
+        seed: seed_t = None
+    ):
         self.z_dim = z_dim
         self.a = torch.tensor(float(a), device=device)
         self.b = torch.tensor(float(b), device=device)
-        self.distr = D.Uniform(self.a, self.b)
+        self.gen = set_generator(seed=seed, device=device)
+        self.device = device
+        self.dtype = dtype
 
     def __call__(self, n_dim: int):
-        return self.distr.sample((n_dim, self.z_dim, 1, 1))
+        unif_ = torch.rand(
+            (n_dim, self.z_dim, 1, 1), generator=self.gen,
+            device=self.device, dtype=self.dtype
+        )
+        return self.a + (self.b - self.a) * unif_
+        # return self.distr.sample((n_dim, self.z_dim, 1, 1))
 
     def log_prob(self, z: torch.Tensor) -> torch.Tensor:
         restrict = ((z >= self.a) & (z <= self.b)).bool()
@@ -249,19 +283,28 @@ class norm(latent_distr):
         self,
         z_dim: int,
         device: _device_t,
+        dtype: torch.dtype = torch.float32,
         loc: float = 0,
         scale: float = 1,
+        seed: seed_t = None
     ):
         self.z_dim = z_dim
         self.loc = torch.tensor(float(loc), device=device)
         self.scale = torch.tensor(float(scale), device=device)
-        self.distr = D.Normal(self.loc, self.scale)
+        self.gen = set_generator(seed=seed, device=device)
+        self.device = device
+        self.dtype = dtype
 
     def __call__(self, n_dim: int):
-        return self.distr.sample((n_dim, self.z_dim, 1, 1))
+        randn = torch.randn(
+            (n_dim, self.z_dim, 1, 1), generator=self.gen,
+            device=self.device, dtype=self.dtype
+        )
+        return self.loc + self.scale * randn
+        # return self.distr.sample((n_dim, self.z_dim, 1, 1))
 
     def log_prob(self, z: torch.Tensor) -> torch.Tensor:
-        norm_z_2 = torch.sum(z**2, dim=1)
+        norm_z_2 = torch.sum(z ** 2, dim=1)
         return -0.5 * norm_z_2.unsqueeze(1)
 
 
@@ -277,18 +320,31 @@ class LatentDistribution:
         name: Literal["unif", "norm"],
         z_dim: int,
         device: _device_t = "cpu",
+        dtype: torch.dtype = torch.float32,
+        seed: seed_t = None,
         **kwargs,
     ):
         self.name = name
         self.device = device
+        self.dtype = dtype
         self.z_dim = z_dim
-        self._lat_distr = _LATENT_DISTR[name](z_dim=z_dim, device=device, **kwargs)
+        self._lat_distr: latent_distr = _LATENT_DISTR[name](
+            z_dim, device, dtype, seed=seed, **kwargs
+        )
 
     def __call__(self, n_dim: int):
         return self._lat_distr(n_dim)
 
     def __repr__(self):
-        return f"{self.__class__.__name__}(name={self.name}, z_dim={self.z_dim}, device={self.device})"
+        to_return = f"{self.__class__.__name__}"
+        to_return += "("
+        to_return += f"name={self.name}, "
+        to_return += f"z_dim={self.z_dim}, "
+        to_return += f"device={self.device}, "
+        to_return += f"dtype={self.dtype}, "
+        to_return += f"seed={self._lat_distr.gen.initial_seed()}"
+        to_return += ")"
+        return to_return
 
 
 # Generator model
@@ -321,7 +377,7 @@ class Generator(nn.Module):
         self.res_layers = nn.Sequential()
         for i in range(len(num_filters) - 1):
             res = Block(num_filters[i], num_filters[i + 1], resample=resample_list[i])
-            self.res_layers.add_module(f"res{i+1}", res)
+            self.res_layers.add_module(f"res{i + 1}", res)
 
         self.conv_out = nn.Conv2d(
             num_filters[-1], channels_img, kernel_size=3, padding=1
@@ -363,7 +419,7 @@ class Critic(nn.Module):
                 norm_layer=norm_layer,
                 act_func=nn.LeakyReLU(0.2),
             )
-            self.res_layers.add_module(f"res{i+1}", res)
+            self.res_layers.add_module(f"res{i + 1}", res)
 
         self.down_sample = nn.AdaptiveAvgPool2d(1)
 
@@ -406,7 +462,7 @@ class Encoder(nn.Module):
                 norm_layer=norm_layer,
                 act_func=nn.LeakyReLU(0.2),
             )
-            self.res_layers.add_module(f"res{i+1}", res)
+            self.res_layers.add_module(f"res{i + 1}", res)
 
         self.output_layer = nn.Sequential()
         # Convolutional Layer
