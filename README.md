@@ -7,7 +7,7 @@ If you use this code in your work, please reference it as follows:
   title   = {{wgan-gp}},
   url     = {https://github.com/framunoz/wgan-gp},
   license = {MIT},
-  month   = {10},
+  month   = {08},
   year    = {2023}
 }
 ```
