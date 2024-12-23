@@ -103,7 +103,9 @@ class Generator(nn.Module):
 
 # critic model
 class Critic(nn.Module):
-    def __init__(self, channels_img=3, num_filters: Iterable[int] = (32, 64, 128, 256)):
+    def __init__(
+        self, channels_img=3, num_filters: Iterable[int] = (32, 64, 128, 256)
+    ):
         super().__init__()
 
         # Hidden layers

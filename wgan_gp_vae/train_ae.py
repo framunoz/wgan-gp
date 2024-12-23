@@ -31,14 +31,12 @@ SAVE_DIR.mkdir(exist_ok=True)
 PLOT_DIR = Path("plots")
 PLOT_DIR.mkdir(exist_ok=True)
 
-transforms = T.Compose(
-    [
-        T.Resize(32),
-        T.ToImageTensor(),
-        T.ConvertDtype(),
-        T.Normalize([0.5 for _ in range(1)], [0.5 for _ in range(1)]),
-    ]
-)
+transforms = T.Compose([
+    T.Resize(32),
+    T.ToImageTensor(),
+    T.ConvertDtype(),
+    T.Normalize([0.5 for _ in range(1)], [0.5 for _ in range(1)]),
+])
 
 
 dataset = qt.QuickDraw(
@@ -74,7 +72,12 @@ N, in_ch, H, W = 8, 1, 32, 32
 x = torch.randn((N, in_ch, H, W)).to(DEV)
 z = torch.randn((N, LATENT_DIM, 1, 1)).to(DEV)
 
-assert E(x).shape == (N, LATENT_DIM, 1, 1), f"Generator test failed {E(x).shape = }"
+assert E(x).shape == (
+    N,
+    LATENT_DIM,
+    1,
+    1,
+), f"Generator test failed {E(x).shape = }"
 assert G(z).shape == (N, in_ch, H, W), "Generator test failed"
 
 criterion = nn.MSELoss()
@@ -110,7 +113,8 @@ for epoch in range(1, EPOCHS + 1):
         loss = criterion(x_real, x_recon)
         sum_loss += loss.item()
         tepoch.set_postfix(
-            loss=f"{loss.item():.6f}", avg_loss=f"{sum_loss / (batch_idx + 1):.6f}"
+            loss=f"{loss.item():.6f}",
+            avg_loss=f"{sum_loss / (batch_idx + 1):.6f}",
         )
 
         E.zero_grad()

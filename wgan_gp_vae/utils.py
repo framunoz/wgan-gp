@@ -12,14 +12,18 @@ TypeModels = Literal["encoder", "generator"]
 
 
 @torch.jit.script
-def interpolate_images(real: torch.Tensor, fake: torch.Tensor, alpha: torch.Tensor):
+def interpolate_images(
+    real: torch.Tensor, fake: torch.Tensor, alpha: torch.Tensor
+):
     return real * alpha + fake * (1 - alpha)
 
 
 @torch.jit.script
 def compute_gradient_penalty_norm(gradient: torch.Tensor, penalty_gr: float):
     gradient_norm = gradient.norm(2, dim=1)
-    gradient_penalty = torch.mean(F.leaky_relu(gradient_norm - 1, penalty_gr) ** 2)
+    gradient_penalty = torch.mean(
+        F.leaky_relu(gradient_norm - 1, penalty_gr) ** 2
+    )
     return gradient_penalty, gradient_norm
 
 
@@ -73,7 +77,9 @@ def gradient_penalty(critic, real, fake, device="cpu", penalty_gr=10):
     )[0]
     gradient = gradient.view(gradient.shape[0], -1)
     gradient_norm = gradient.norm(2, dim=1)
-    gradient_penalty = torch.mean(F.leaky_relu(gradient_norm - 1, penalty_gr) ** 2)
+    gradient_penalty = torch.mean(
+        F.leaky_relu(gradient_norm - 1, penalty_gr) ** 2
+    )
     return gradient_penalty, gradient_norm
 
 
@@ -106,7 +112,9 @@ def alexnet_norm(x):
         x.max() <= 1 or x.min() >= 0
     ), f"Alexnet received input outside of range [0,1]: {x.min(),x.max()}"
     out = x - torch.tensor([0.485, 0.456, 0.406]).reshape(1, 3, 1, 1).type_as(x)
-    out = out / torch.tensor([0.229, 0.224, 0.225]).reshape(1, 3, 1, 1).type_as(x)
+    out = out / torch.tensor([0.229, 0.224, 0.225]).reshape(1, 3, 1, 1).type_as(
+        x
+    )
     return out
 
 
@@ -231,31 +239,27 @@ class ProjectorOnManifold:
         self.img_size = image_size
         self._img_size_net = image_size_net
         channels_img = image_size_net[0]
-        self._transform_in = transform_in or transforms.Compose(
-            [
-                # From pdf to grayscale
-                transforms.Lambda(lambda x: x / torch.max(x)),
-                # transforms.Lambda(lambda x: x),
-                transforms.ToPILImage(),
-                transforms.Resize(image_size_net[1:]),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    [0.5 for _ in range(channels_img)],
-                    [0.5 for _ in range(channels_img)],
-                ),
-            ]
-        )
-        self._transform_out = transform_out or transforms.Compose(
-            [
-                # Ensure the range is in [0, 1]
-                transforms.Lambda(lambda x: x - torch.min(x)),
-                transforms.Lambda(lambda x: x / torch.max(x)),
-                transforms.ToPILImage(),
-                transforms.Resize(image_size[1:]),
-                transforms.ToTensor(),
-                transforms.Lambda(lambda x: x / torch.sum(x)),
-            ]
-        )
+        self._transform_in = transform_in or transforms.Compose([
+            # From pdf to grayscale
+            transforms.Lambda(lambda x: x / torch.max(x)),
+            # transforms.Lambda(lambda x: x),
+            transforms.ToPILImage(),
+            transforms.Resize(image_size_net[1:]),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                [0.5 for _ in range(channels_img)],
+                [0.5 for _ in range(channels_img)],
+            ),
+        ])
+        self._transform_out = transform_out or transforms.Compose([
+            # Ensure the range is in [0, 1]
+            transforms.Lambda(lambda x: x - torch.min(x)),
+            transforms.Lambda(lambda x: x / torch.max(x)),
+            transforms.ToPILImage(),
+            transforms.Resize(image_size[1:]),
+            transforms.ToTensor(),
+            transforms.Lambda(lambda x: x / torch.sum(x)),
+        ])
 
     @torch.no_grad()
     def forward(self, x):

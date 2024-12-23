@@ -1,14 +1,22 @@
 import abc
 import functools
-from typing import Callable, Iterable, Literal, Optional, Type
+from typing import (
+    Callable,
+    Collection,
+    Iterable,
+    Literal,
+    Optional,
+    Sequence,
+    Type,
+)
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-_norm_layer_t = Optional[Literal["instance_norm", "batch_norm"]]
+_norm_layer_t = Literal["instance_norm", "batch_norm"] | None
 _device_t = str | torch.device
-_resample_t = Optional[Literal["up", "down"]]
+_resample_t = Literal["up", "down"] | None
 type seed_t = int | None
 
 
@@ -38,12 +46,14 @@ def norm_layer_factory(norm_layer: _norm_layer_t) -> Type[nn.Module]:
 
         case str(value):
             raise ValueError(
-                f"Please choose an option between 'instance_norm' or 'batch_norm', not '{value}'."
+                "Please choose an option between 'instance_norm' or"
+                f" 'batch_norm', not '{value}'."
             )
 
         case _:
             raise TypeError(
-                "Please provide a string from the list ['instance_norm', 'batch_norm']."
+                "Please provide a string from the list ['instance_norm',"
+                " 'batch_norm']."
             )
 
     return norm_layer
@@ -89,7 +99,8 @@ def resample_factory(
 
         case str(value):
             raise ValueError(
-                f"Please choose an option between 'up', 'down' or None, not '{value}'."
+                "Please choose an option between 'up', 'down' or None, not"
+                f" '{value}'."
             )
 
         case _:
@@ -109,7 +120,7 @@ class ResidualBlock(nn.Module):
         out_channels: int,
         resample: _resample_t = None,
         norm_layer: _norm_layer_t = "batch_norm",
-        act_func=nn.ReLU(),
+        act_func: nn.Module = nn.ReLU(),
     ):
         super().__init__()
 
@@ -173,7 +184,13 @@ class ResidualBlockV2(ResidualBlock):
         norm_layer: _norm_layer_t = "batch_norm",
         act_func=nn.ReLU(),
     ):
-        super().__init__(in_channels, out_channels, resample, norm_layer, act_func)
+        super().__init__(
+            in_channels,
+            out_channels,
+            resample,
+            norm_layer,
+            act_func,
+        )
 
         self.norm1 = self.norm_layer(in_channels) if self.norm_layer else None
 
@@ -207,7 +224,9 @@ class ResidualBlockV2(ResidualBlock):
 _Block = ResidualBlock
 
 
-def set_generator(seed: seed_t = None, device: _device_t = "cpu") -> torch.Generator:
+def set_generator(
+    seed: seed_t = None, device: _device_t = "cpu"
+) -> torch.Generator:
     """
     Set the generator for the random number generator.
 
@@ -234,7 +253,9 @@ class latent_distr(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def log_prob(self, z: torch.Tensor, device: _device_t = "cpu") -> torch.Tensor:
+    def log_prob(
+        self, z: torch.Tensor, device: _device_t = "cpu"
+    ) -> torch.Tensor:
         """Return the log probability of z."""
         raise NotImplementedError
 
@@ -251,7 +272,7 @@ class unif(latent_distr):
         dtype: torch.dtype = torch.float32,
         a: float = -1,
         b: float = 1,
-        seed: seed_t = None
+        seed: seed_t = None,
     ):
         self.z_dim = z_dim
         self.a = torch.tensor(float(a), device=device)
@@ -262,8 +283,10 @@ class unif(latent_distr):
 
     def __call__(self, n_dim: int):
         unif_ = torch.rand(
-            (n_dim, self.z_dim, 1, 1), generator=self.gen,
-            device=self.device, dtype=self.dtype
+            (n_dim, self.z_dim, 1, 1),
+            generator=self.gen,
+            device=self.device,
+            dtype=self.dtype,
         )
         return self.a + (self.b - self.a) * unif_
         # return self.distr.sample((n_dim, self.z_dim, 1, 1))
@@ -286,7 +309,7 @@ class norm(latent_distr):
         dtype: torch.dtype = torch.float32,
         loc: float = 0,
         scale: float = 1,
-        seed: seed_t = None
+        seed: seed_t = None,
     ):
         self.z_dim = z_dim
         self.loc = torch.tensor(float(loc), device=device)
@@ -297,14 +320,16 @@ class norm(latent_distr):
 
     def __call__(self, n_dim: int):
         randn = torch.randn(
-            (n_dim, self.z_dim, 1, 1), generator=self.gen,
-            device=self.device, dtype=self.dtype
+            (n_dim, self.z_dim, 1, 1),
+            generator=self.gen,
+            device=self.device,
+            dtype=self.dtype,
         )
         return self.loc + self.scale * randn
         # return self.distr.sample((n_dim, self.z_dim, 1, 1))
 
     def log_prob(self, z: torch.Tensor) -> torch.Tensor:
-        norm_z_2 = torch.sum(z ** 2, dim=1)
+        norm_z_2 = torch.sum(z**2, dim=1)
         return -0.5 * norm_z_2.unsqueeze(1)
 
 
@@ -354,18 +379,20 @@ class Generator(nn.Module):
         self,
         latent_dim: int,
         channels_img: int = 3,
-        num_filters: Iterable[int] = (128, 128, 128, 128, 128),
-        resample_list: Iterable[Optional[str]] = ("up", "up", "up", None),
+        num_filters: Sequence[int] = (128, 128, 128, 128, 128),
+        resample_list: Sequence[_resample_t] = ("up", "up", "up", None),
         Block=_Block,
-        latent_distr: str | latent_distr = "norm",
+        latent_distr: Literal["norm", "unif"] = "norm",
     ) -> None:
         super().__init__()
-        resample_list = (
-            ["up"] * (len(num_filters) - 1) if resample_list is None else resample_list
+        _list_default: Sequence[_resample_t] = ["up"] * (len(num_filters) - 1)  # type: ignore
+        resample_list: Sequence[_resample_t] = list(
+            _list_default if resample_list is None else resample_list
         )
         if len(num_filters) - 1 != len(resample_list):
             raise ValueError(
-                f"Iterables 'num_filters' and 'resample_list' must have same length. {len(num_filters)} - 1 != {len(resample_list)}"
+                "Iterables 'num_filters' and 'resample_list' must have same"
+                f" length. {len(num_filters)} - 1 != {len(resample_list)}"
             )
 
         self.latent_dim = latent_dim
@@ -376,7 +403,9 @@ class Generator(nn.Module):
 
         self.res_layers = nn.Sequential()
         for i in range(len(num_filters) - 1):
-            res = Block(num_filters[i], num_filters[i + 1], resample=resample_list[i])
+            res = Block(
+                num_filters[i], num_filters[i + 1], resample=resample_list[i]
+            )
             self.res_layers.add_module(f"res{i + 1}", res)
 
         self.conv_out = nn.Conv2d(
@@ -397,14 +426,15 @@ class Critic(nn.Module):
     def __init__(
         self,
         channels_img=3,
-        num_filters: Iterable[int] = (128, 128, 128, 128),
-        resample_list=("down", "down", None, None),
+        num_filters: Sequence[int] = (128, 128, 128, 128),
+        resample_list: Sequence[_resample_t] = ("down", "down", None, None),
         Block=_Block,
     ):
         super().__init__()
         if len(num_filters) != len(resample_list):
             raise ValueError(
-                "Iterables 'num_filters' and 'resample_list' must have same length."
+                "Iterables 'num_filters' and 'resample_list' must have same"
+                " length."
             )
         num_filters = [channels_img] + list(num_filters)
 
@@ -440,14 +470,15 @@ class Encoder(nn.Module):
         self,
         latent_dim,
         channels_img=3,
-        num_filters: Iterable[int] = (128, 128, 128, 128),
+        num_filters: Collection[int] = (128, 128, 128, 128),
         resample_list=("down", "down", "down", None),
         Block=_Block,
     ):
         super().__init__()
         if len(num_filters) != len(resample_list):
             raise ValueError(
-                "Iterables 'num_filters' and 'resample_list' must have same length."
+                "Iterables 'num_filters' and 'resample_list' must have same"
+                " length."
             )
         num_filters = [channels_img] + list(num_filters)
 
@@ -493,7 +524,9 @@ def _test():
     z = torch.randn((N, latent_dim, 1, 1)).to(dev)
 
     out_channels = 32
-    conv = UpsampleConv2d(in_channels, out_channels, kernel_size=3, padding=1).to(dev)
+    conv = UpsampleConv2d(
+        in_channels, out_channels, kernel_size=3, padding=1
+    ).to(dev)
     assert conv(x).shape == (
         N,
         out_channels,
@@ -502,8 +535,15 @@ def _test():
     ), "UpsampleConv2d test failed"
 
     out_channels = 128
-    conv = AvgPoolConv2d(in_channels, out_channels, kernel_size=3, padding=1).to(dev)
-    assert conv(x).shape == (N, out_channels, H / 2, W / 2), "AvgPoolConv2d test failed"
+    conv = AvgPoolConv2d(
+        in_channels, out_channels, kernel_size=3, padding=1
+    ).to(dev)
+    assert conv(x).shape == (
+        N,
+        out_channels,
+        H / 2,
+        W / 2,
+    ), "AvgPoolConv2d test failed"
 
     out_channels = 256
     # Check norm layer is a correct instance
@@ -537,7 +577,10 @@ def _test():
 
     # Generator test
     gen = Generator(
-        latent_dim, in_channels, [128, 64, 32, 16, 8], latent_distr="norm"
+        latent_dim,
+        in_channels,
+        [128, 64, 32, 16, 8],
+        latent_distr="norm",
     ).to(dev)
     assert gen(z).shape == (N, in_channels, H, W), "Generator test failed"
     print(gen)

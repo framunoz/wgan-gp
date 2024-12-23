@@ -10,7 +10,9 @@ from torch.utils import data
 from torchvision.datasets.vision import VisionDataset
 
 BINARY_URL = "https://storage.googleapis.com/quickdraw_dataset/full/binary/"
-NUMPY_URL = "https://storage.googleapis.com/quickdraw_dataset/full/numpy_bitmap/"
+NUMPY_URL = (
+    "https://storage.googleapis.com/quickdraw_dataset/full/numpy_bitmap/"
+)
 CACHE_DIR = Path(".", ".quickdrawcache")
 
 
@@ -40,7 +42,7 @@ class H5Loader(data.Dataset):
 class NpyDataset(VisionDataset):
     def __init__(
         self,
-        root=Path("dataset/quick_draw/face.npy"),
+        root: str | Path | None = Path("dataset/quick_draw/face.npy"),
         transform=None,
         shape=(28, 28),
     ) -> None:
@@ -97,7 +99,11 @@ class QuickDraw(VisionDataset):
         all_data = self.folder / f"{self.category}.npy"
         recog_data = self.folder / f"{self.category}_recognized.npy"
         not_recog_data = self.folder / f"{self.category}_not_recognized.npy"
-        return all_data.exists() and recog_data.exists() and not_recog_data.exists()
+        return (
+            all_data.exists()
+            and recog_data.exists()
+            and not_recog_data.exists()
+        )
 
     def download(self):
         if self._check_all_files_exists():
@@ -132,9 +138,12 @@ class QuickDraw(VisionDataset):
             recognized = np.array(recognized)
             data_recognized = data[recognized]
             data_not_recognized = data[~recognized]
-            np.save(self.folder / f"{self.category}_recognized.npy", data_recognized)
             np.save(
-                self.folder / f"{self.category}_not_recognized.npy", data_not_recognized
+                self.folder / f"{self.category}_recognized.npy", data_recognized
+            )
+            np.save(
+                self.folder / f"{self.category}_not_recognized.npy",
+                data_not_recognized,
             )
         except Exception as error:
             print(f"Failed to download (trying next):\n{error}")
@@ -162,7 +171,9 @@ class QuickDraw(VisionDataset):
         return len(self.data)
 
 
-def get_h5_dataset(path="shoes_images/shoes.hdf5", batch_size=128, shuffle=True):
+def get_h5_dataset(
+    path="shoes_images/shoes.hdf5", batch_size=128, shuffle=True
+):
     return data.DataLoader(
         dataset=H5Loader(path), batch_size=batch_size, shuffle=shuffle
     )
