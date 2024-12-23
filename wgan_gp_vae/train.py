@@ -19,15 +19,10 @@ import torch.optim as optim
 import torchvision
 import torchvision.datasets as datasets
 import torchvision.models as models
+import torchvision.transforms.functional as TF
 import torchvision.transforms.v2 as T
 import utils
-from model_resnet import (
-    Critic,
-    Encoder,
-    Generator,
-    LatentDistribution,
-    ResidualBlock,
-)
+from model_resnet import Critic, Encoder, Generator, LatentDistribution, ResidualBlock
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -130,16 +125,17 @@ class CriticIterations:
                 + f"last_loss={self.last_loss:.4f}, "
                 + f"new_loss={self.new_loss:.4f}, "
             )
-            to_return += (
-                f"\n{tab}" + f"k={self.k}, " + f"patience={self.patience}, "
-            )
+            to_return += f"\n{tab}" + f"k={self.k}, " + f"patience={self.patience}, "
             to_return += (
                 f"\n{tab}"
                 + f"max_loss={self.max_loss:.4f}, "
                 + f"diff_loss={self.diff_loss:.4f}, "
                 + f"max_diff_loss={self.max_diff_loss}, "
             )
-            to_return = to_return.rstrip(", ")
+
+            if to_return.endswith(", "):
+                to_return = to_return[:-2]
+
             to_return += "\n)"
 
         return to_return
@@ -164,13 +160,9 @@ def get_dataset(transform, ds_type: str, file_path: str = None):
     test_dataset = None
 
     if ds_type == "mnist":
-        dataset = datasets.MNIST(
-            root="dataset/", transform=transform, download=True
-        )
+        dataset = datasets.MNIST(root="dataset/", transform=transform, download=True)
     elif ds_type == "celeba":
-        dataset = datasets.ImageFolder(
-            root="celeb_dataset", transform=transform
-        )
+        dataset = datasets.ImageFolder(root="celeb_dataset", transform=transform)
     elif ds_type == "quickdraw":
         categories = [qt.Category.FACE]
         dataset_ = qt.QuickDraw(
@@ -239,14 +231,16 @@ def train_wgan_and_wae(
     device = get_device(device)
 
     # Transforms
-    transform = transform or T.Compose([
-        T.Resize(image_size),
-        T.ToTensor(),
-        T.Normalize(
-            [0.5 for _ in range(channels_img)],
-            [0.5 for _ in range(channels_img)],
-        ),
-    ])
+    transform = transform or T.Compose(
+        [
+            T.Resize(image_size),
+            T.ToTensor(),
+            T.Normalize(
+                [0.5 for _ in range(channels_img)],
+                [0.5 for _ in range(channels_img)],
+            ),
+        ]
+    )
 
     # Dataset and Dataloader
     dataset, val_dataset = get_dataset(file_path=file_path, transform=transform)
@@ -268,9 +262,7 @@ def train_wgan_and_wae(
 
     # Models
     if nn_kwargs:
-        G = Generator(latent_dim, channels_img, **nn_kwargs["generator"]).to(
-            device
-        )
+        G = Generator(latent_dim, channels_img, **nn_kwargs["generator"]).to(device)
         C = Critic(channels_img, **nn_kwargs["critic"]).to(device)
         E = Encoder(latent_dim, channels_img, **nn_kwargs["encoder"]).to(device)
     else:
@@ -368,8 +360,7 @@ def train_wgan_and_wae(
                 tqdm(
                     data_loader,
                     desc=(
-                        f"Epoch [{epoch}/{num_epochs}], Patience"
-                        f" {current_patience}"
+                        f"Epoch [{epoch}/{num_epochs}], Patience" f" {current_patience}"
                     ),
                 )
             )
@@ -401,9 +392,7 @@ def train_wgan_and_wae(
             for _ in range(critic_iterations):
                 # Train encoder: min |real - generator(encoder(real))| + penalization
                 z = G.sample_noise(n, type_as=real)
-                z_tilde = E(
-                    real
-                )  # Generate \tilde{z}_i from Q(Z|x_i) for i = 1:n
+                z_tilde = E(real)  # Generate \tilde{z}_i from Q(Z|x_i) for i = 1:n
                 x_recon = G(z_tilde)
 
                 # According to the paper, this is the Wasserstein distance
@@ -474,9 +463,7 @@ def train_wgan_and_wae(
                     wass_dist_name_WGAN = "Wasserstein Distance WGAN"
                     wass_dist_name_WAE = "Wasserstein Distance WAE"
                     gradient_norm_name = "Gradient Norm"
-                    writer_real.add_image(
-                        "1 Real", img_grid_real, global_step=step
-                    )
+                    writer_real.add_image("1 Real", img_grid_real, global_step=step)
                     writer_fake.add_image(
                         "2 Decoded", img_grid_fake_WAE, global_step=step
                     )
@@ -526,9 +513,7 @@ def train_wgan_and_wae(
 
         # Validation loop
         if verbose:
-            iterable = tqdm(
-                val_data_loader, desc=f"Val. Epoch [{epoch}/{num_epochs}]"
-            )
+            iterable = tqdm(val_data_loader, desc=f"Val. Epoch [{epoch}/{num_epochs}]")
         else:
             iterable = val_data_loader
 
@@ -570,21 +555,13 @@ def train_wgan_and_wae(
             current_patience += 1
 
         global_epoch = step - 1
-        avg_wass_dist_WGAN = torch.mean(
-            torch.FloatTensor(epoch_wass_dist_WGAN)
-        ).item()
-        avg_wass_dist_WAE = torch.mean(
-            torch.FloatTensor(epoch_wass_dist_WAE)
-        ).item()
+        avg_wass_dist_WGAN = torch.mean(torch.FloatTensor(epoch_wass_dist_WGAN)).item()
+        avg_wass_dist_WAE = torch.mean(torch.FloatTensor(epoch_wass_dist_WAE)).item()
         C_avg_loss = torch.mean(torch.FloatTensor(C_epoch_losses)).item()
         G_avg_loss = torch.mean(torch.FloatTensor(G_epoch_losses)).item()
         E_avg_loss = torch.mean(torch.FloatTensor(E_epoch_losses)).item()
-        critic_real_avg_loss = torch.mean(
-            torch.FloatTensor(critic_real_values)
-        ).item()
-        critic_fake_avg_loss = torch.mean(
-            torch.FloatTensor(critic_fake_values)
-        ).item()
+        critic_real_avg_loss = torch.mean(torch.FloatTensor(critic_real_values)).item()
+        critic_fake_avg_loss = torch.mean(torch.FloatTensor(critic_fake_values)).item()
         gradient_norm_values_avg = torch.mean(
             torch.FloatTensor(gradient_norm_values)
         ).item()
@@ -622,20 +599,12 @@ def train_wgan_and_wae(
         )
         writer_loss.add_scalars(
             wass_dist_name_WAE,
-            {
-                "Avg. "
-                + wass_dist_name_WAE
-                + " Validation": avg_wass_dist_WAE_val
-            },
+            {"Avg. " + wass_dist_name_WAE + " Validation": avg_wass_dist_WAE_val},
             global_epoch,
         )
         writer_loss.add_scalars(
             wass_dist_name_WGAN,
-            {
-                "Avg. "
-                + wass_dist_name_WGAN
-                + " Validation": avg_wass_dist_WGAN_val
-            },
+            {"Avg. " + wass_dist_name_WGAN + " Validation": avg_wass_dist_WGAN_val},
             global_epoch,
         )
 
@@ -683,19 +652,19 @@ def train_wgan_and_wae_optimized(
 ):
     device = get_device(device)
 
-    critic_iterations = CriticIterations(
-        critic_iterations, patience=crit_iter_patience
-    )
+    critic_iterations = CriticIterations(critic_iterations, patience=crit_iter_patience)
 
     # Transforms
-    transform = transform or T.Compose([
-        T.Resize(image_size),
-        T.ToTensor(),
-        T.Normalize(
-            [0.5 for _ in range(channels_img)],
-            [0.5 for _ in range(channels_img)],
-        ),
-    ])
+    transform = transform or T.Compose(
+        [
+            T.Resize(image_size),
+            T.ToTensor(),
+            T.Normalize(
+                [0.5 for _ in range(channels_img)],
+                [0.5 for _ in range(channels_img)],
+            ),
+        ]
+    )
 
     # Dataset and Dataloader
     dataset, val_dataset = get_dataset(
@@ -721,9 +690,7 @@ def train_wgan_and_wae_optimized(
 
     # Models
     if nn_kwargs:
-        G = Generator(latent_dim, channels_img, **nn_kwargs["generator"]).to(
-            device
-        )
+        G = Generator(latent_dim, channels_img, **nn_kwargs["generator"]).to(device)
         C = Critic(channels_img, **nn_kwargs["critic"]).to(device)
         E = Encoder(latent_dim, channels_img, **nn_kwargs["encoder"]).to(device)
     else:
@@ -838,8 +805,7 @@ def train_wgan_and_wae_optimized(
                 tqdm(
                     data_loader,
                     desc=(
-                        f"Epoch [{epoch}/{num_epochs}], "
-                        f"Patience {current_patience}"
+                        f"Epoch [{epoch}/{num_epochs}], " f"Patience {current_patience}"
                     ),
                 )
             )
@@ -960,9 +926,7 @@ def train_wgan_and_wae_optimized(
                     wass_dist_name_WGAN = "Wasserstein Distance WGAN"
                     wass_dist_name_WAE = "Wasserstein Distance WAE"
                     gradient_norm_name = "Gradient Norm"
-                    writer_real.add_image(
-                        "1 Real", img_grid_real, global_step=step
-                    )
+                    writer_real.add_image("1 Real", img_grid_real, global_step=step)
                     writer_fake.add_image(
                         "2 Decoded", img_grid_fake_WAE, global_step=step
                     )
@@ -1017,9 +981,7 @@ def train_wgan_and_wae_optimized(
 
         # Validation loop
         if verbose:
-            iterable = tqdm(
-                val_data_loader, desc=f"Val. Epoch [{epoch}/{num_epochs}]"
-            )
+            iterable = tqdm(val_data_loader, desc=f"Val. Epoch [{epoch}/{num_epochs}]")
         else:
             iterable = val_data_loader
 
@@ -1061,36 +1023,22 @@ def train_wgan_and_wae_optimized(
         else:
             current_patience += 1
             # Save models
-            torch.save(
-                deepcopy(G.state_dict()), save_dir / "generator_overfitted.pt"
-            )
+            torch.save(deepcopy(G.state_dict()), save_dir / "generator_overfitted.pt")
             torch.save(
                 deepcopy(C.state_dict()),
                 save_dir / "discriminator_overfitted.pt",
             )
-            torch.save(
-                deepcopy(E.state_dict()), save_dir / "encoder_overfitted.pt"
-            )
+            torch.save(deepcopy(E.state_dict()), save_dir / "encoder_overfitted.pt")
 
         global_epoch = step - 1
-        avg_wass_dist_WGAN = torch.mean(
-            torch.FloatTensor(epoch_wass_dist_WGAN)
-        ).item()
-        avg_wass_dist_WAE = torch.mean(
-            torch.FloatTensor(epoch_wass_dist_WAE)
-        ).item()
+        avg_wass_dist_WGAN = torch.mean(torch.FloatTensor(epoch_wass_dist_WGAN)).item()
+        avg_wass_dist_WAE = torch.mean(torch.FloatTensor(epoch_wass_dist_WAE)).item()
         C_avg_loss = torch.mean(torch.FloatTensor(C_epoch_losses)).item()
         G_avg_loss = torch.mean(torch.FloatTensor(G_epoch_losses)).item()
         E_avg_loss = torch.mean(torch.FloatTensor(E_epoch_losses)).item()
-        critic_real_avg_loss = torch.mean(
-            torch.FloatTensor(critic_real_values)
-        ).item()
-        critic_fake_avg_loss = torch.mean(
-            torch.FloatTensor(critic_fake_values)
-        ).item()
-        critic_mean_avg_loss = torch.mean(
-            torch.FloatTensor(critic_mean_values)
-        ).item()
+        critic_real_avg_loss = torch.mean(torch.FloatTensor(critic_real_values)).item()
+        critic_fake_avg_loss = torch.mean(torch.FloatTensor(critic_fake_values)).item()
+        critic_mean_avg_loss = torch.mean(torch.FloatTensor(critic_mean_values)).item()
         mov_avg_critic_val_avg = torch.mean(
             torch.FloatTensor(mov_avg_critic_vals)
         ).item()
@@ -1134,20 +1082,12 @@ def train_wgan_and_wae_optimized(
         )
         writer_loss.add_scalars(
             wass_dist_name_WAE,
-            {
-                "Avg. "
-                + wass_dist_name_WAE
-                + " Validation": avg_wass_dist_WAE_val
-            },
+            {"Avg. " + wass_dist_name_WAE + " Validation": avg_wass_dist_WAE_val},
             global_epoch,
         )
         writer_loss.add_scalars(
             wass_dist_name_WGAN,
-            {
-                "Avg. "
-                + wass_dist_name_WGAN
-                + " Validation": avg_wass_dist_WGAN_val
-            },
+            {"Avg. " + wass_dist_name_WGAN + " Validation": avg_wass_dist_WGAN_val},
             global_epoch,
         )
 
@@ -1159,6 +1099,7 @@ def train_wgan_and_wae_optimized(
         G_scheduler.step()
         C_scheduler.step()
         E_scheduler.step()
+
 
 def train_wae_optimized(
     latent_dim,  # =100
@@ -1189,14 +1130,17 @@ def train_wae_optimized(
     device = get_device(device)
 
     # Transforms
-    transform = transform or T.Compose([
-        T.Resize(image_size),
-        T.ToTensor(),
-        T.Normalize(
-            [0.5 for _ in range(channels_img)],
-            [0.5 for _ in range(channels_img)],
-        ),
-    ])
+    transform = transform or T.Compose(
+        [
+            T.Resize(image_size),
+            T.ToTensor(),
+            T.Normalize(
+                [0.5 for _ in range(channels_img)],
+                [0.5 for _ in range(channels_img)],
+            ),
+        ]
+    )
+    gaussian_blur = T.GaussianBlur(17, (0.1, 5))
 
     # Dataset and Dataloader
     dataset, val_dataset = get_dataset(
@@ -1222,9 +1166,7 @@ def train_wae_optimized(
 
     # Models
     if nn_kwargs:
-        G = Generator(latent_dim, channels_img, **nn_kwargs["generator"]).to(
-            device
-        )
+        G = Generator(latent_dim, channels_img, **nn_kwargs["generator"]).to(device)
         E = Encoder(latent_dim, channels_img, **nn_kwargs["encoder"]).to(device)
     else:
         G = Generator(latent_dim, channels_img).to(device)
@@ -1296,7 +1238,6 @@ def train_wae_optimized(
     print(noise_sampler)
     print(f"{save_dir = }")
 
-
     for epoch in range(1, num_epochs + 1):
         # Free memory
         torch.cuda.empty_cache()
@@ -1310,8 +1251,7 @@ def train_wae_optimized(
                 tqdm(
                     data_loader,
                     desc=(
-                        f"Epoch [{epoch}/{num_epochs}], "
-                        f"Patience {current_patience}"
+                        f"Epoch [{epoch}/{num_epochs}], " f"Patience {current_patience}"
                     ),
                 )
             )
@@ -1329,7 +1269,7 @@ def train_wae_optimized(
 
             # Train encoder: min |real - generator(encoder(real))| + penalization
             z = noise_sampler(n)
-            real_blur = T.GaussianBlur(17, (0.1, 5))(real)
+            real_blur = gaussian_blur(real)
             z_tilde = E(real_blur)  # Generate \tilde{z}_i from Q(Z|x_i) for i = 1:n
             x_recon = G(z_tilde)
 
@@ -1355,16 +1295,25 @@ def train_wae_optimized(
                 E_epoch_losses.append(E_loss.data.item())
 
                 with torch.no_grad():
+                    corrupted_real_val = gaussian_blur(real_val)
                     fake_WGAN = G(fixed_noise)
                     fake_WAE = G(E(real))
+                    denoised_real = G(E(real_blur))
                     fake_val_WAE = G(E(real_val))
+                    denoised_real_val = G(E(corrupted_real_val))
 
                     # take out (up to) 32 examples
                     img_grid_real = torchvision.utils.make_grid(
                         real[:32], normalize=True
                     )
+                    img_grid_real_blur = torchvision.utils.make_grid(
+                        real_blur[:32], normalize=True
+                    )
                     img_grid_real_val = torchvision.utils.make_grid(
                         real_val[:32], normalize=True
+                    )
+                    img_grid_real_val_blur = torchvision.utils.make_grid(
+                        corrupted_real_val[:32], normalize=True
                     )
                     img_grid_fake_WGAN = torchvision.utils.make_grid(
                         fake_WGAN[:32], normalize=True
@@ -1372,28 +1321,48 @@ def train_wae_optimized(
                     img_grid_fake_WAE = torchvision.utils.make_grid(
                         fake_WAE[:32], normalize=True
                     )
+                    img_grid_den_real = torchvision.utils.make_grid(
+                        denoised_real[:32], normalize=True
+                    )
                     img_grid_fake_val_WAE = torchvision.utils.make_grid(
                         fake_val_WAE[:32], normalize=True
+                    )
+                    img_grid_den_real_val = torchvision.utils.make_grid(
+                        denoised_real_val[:32], normalize=True
                     )
 
                     loss_G_name = "Loss Generator"
                     loss_E_name = "Loss Encoder"
                     wass_dist_name_WAE = "Wasserstein Distance WAE"
+
                     writer_real.add_image(
                         "1 Real", img_grid_real, global_step=step
+                    )  # fmt: skip
+                    writer_real.add_image(
+                        "2 Real Blurred", img_grid_real_blur, global_step=step
                     )
                     writer_fake.add_image(
-                        "2 Decoded", img_grid_fake_WAE, global_step=step
+                        "3 Decoded", img_grid_fake_WAE, global_step=step
+                    )
+                    writer_fake.add_image(
+                        "4 Denoise", img_grid_den_real, global_step=step
                     )
                     writer_real.add_image(
-                        "3 Real Val", img_grid_real_val, global_step=step
+                        "5 Real Val", img_grid_real_val, global_step=step
+                    )
+                    writer_real.add_image(
+                        "6 Real Val Blurred", img_grid_real_val_blur, global_step=step
                     )
                     writer_fake.add_image(
-                        "4 Decoded Val", img_grid_fake_val_WAE, global_step=step
+                        "7 Decoded Val", img_grid_fake_val_WAE, global_step=step
                     )
                     writer_fake.add_image(
-                        "5 Generated", img_grid_fake_WGAN, global_step=step
+                        "8 Denoise Val", img_grid_den_real_val, global_step=step
                     )
+                    writer_fake.add_image(
+                        "9 Generated", img_grid_fake_WGAN, global_step=step
+                    )
+
                     writer_loss.add_scalars(
                         loss_E_name, {loss_E_name: E_loss}, global_step=step
                     )
@@ -1407,9 +1376,7 @@ def train_wae_optimized(
 
         # Validation loop
         if verbose:
-            iterable = tqdm(
-                val_data_loader, desc=f"Val. Epoch [{epoch}/{num_epochs}]"
-            )
+            iterable = tqdm(val_data_loader, desc=f"Val. Epoch [{epoch}/{num_epochs}]")
         else:
             iterable = val_data_loader
 
@@ -1437,17 +1404,11 @@ def train_wae_optimized(
         else:
             current_patience += 1
             # Save models
-            torch.save(
-                deepcopy(G.state_dict()), save_dir / "generator_overfitted.pt"
-            )
-            torch.save(
-                deepcopy(E.state_dict()), save_dir / "encoder_overfitted.pt"
-            )
+            torch.save(deepcopy(G.state_dict()), save_dir / "generator_overfitted.pt")
+            torch.save(deepcopy(E.state_dict()), save_dir / "encoder_overfitted.pt")
 
         global_epoch = step - 1
-        avg_wass_dist_WAE = torch.mean(
-            torch.FloatTensor(epoch_wass_dist_WAE)
-        ).item()
+        avg_wass_dist_WAE = torch.mean(torch.FloatTensor(epoch_wass_dist_WAE)).item()
         G_avg_loss = torch.mean(torch.FloatTensor(G_epoch_losses)).item()
         E_avg_loss = torch.mean(torch.FloatTensor(E_epoch_losses)).item()
         writer_loss.add_scalars(
@@ -1463,11 +1424,7 @@ def train_wae_optimized(
         )
         writer_loss.add_scalars(
             wass_dist_name_WAE,
-            {
-                "Avg. "
-                + wass_dist_name_WAE
-                + " Validation": avg_wass_dist_WAE_val
-            },
+            {"Avg. " + wass_dist_name_WAE + " Validation": avg_wass_dist_WAE_val},
             global_epoch,
         )
 
@@ -1917,14 +1874,16 @@ def train_gan(
     device = get_device(device)
 
     # Transforms
-    transform = transform or T.Compose([
-        T.Resize(image_size),
-        T.ToTensor(),
-        T.Normalize(
-            [0.5 for _ in range(channels_img)],
-            [0.5 for _ in range(channels_img)],
-        ),
-    ])
+    transform = transform or T.Compose(
+        [
+            T.Resize(image_size),
+            T.ToTensor(),
+            T.Normalize(
+                [0.5 for _ in range(channels_img)],
+                [0.5 for _ in range(channels_img)],
+            ),
+        ]
+    )
 
     # Dataset and Dataloader
     dataset = get_dataset(file_path=file_path, transform=transform)
@@ -1998,9 +1957,7 @@ def train_gan(
                 critic_real = C(real).reshape(-1)
                 critic_fake = C(fake).reshape(-1)
                 gp = gradient_penalty(C, real, fake, device=device)
-                wasserstein_dist = torch.mean(critic_real) - torch.mean(
-                    critic_fake
-                )
+                wasserstein_dist = torch.mean(critic_real) - torch.mean(critic_fake)
                 C_loss = -wasserstein_dist + lambda_gp * gp
                 C.zero_grad()
                 C_loss.backward(retain_graph=True)
@@ -2035,18 +1992,10 @@ def train_gan(
                         "Loss Generator",
                     )
                     wass_dist_name = "Wasserstein Distance"
-                    writer_real.add_image(
-                        "Real", img_grid_real, global_step=step
-                    )
-                    writer_fake.add_image(
-                        "Fake", img_grid_fake, global_step=step
-                    )
-                    writer_loss.add_scalar(
-                        loss_C_name, C_loss, global_step=step
-                    )
-                    writer_loss.add_scalar(
-                        loss_G_name, G_loss, global_step=step
-                    )
+                    writer_real.add_image("Real", img_grid_real, global_step=step)
+                    writer_fake.add_image("Fake", img_grid_fake, global_step=step)
+                    writer_loss.add_scalar(loss_C_name, C_loss, global_step=step)
+                    writer_loss.add_scalar(loss_G_name, G_loss, global_step=step)
                     writer_loss.add_scalar(
                         wass_dist_name, wasserstein_dist, global_step=step
                     )
@@ -2056,9 +2005,7 @@ def train_gan(
         avg_wass_dist = torch.mean(torch.FloatTensor(epoch_wass_dist)).item()
         C_avg_loss = torch.mean(torch.FloatTensor(C_epoch_losses)).item()
         G_avg_loss = torch.mean(torch.FloatTensor(G_epoch_losses)).item()
-        writer_loss.add_scalar(
-            "Average Wasserstein Distance", avg_wass_dist, epoch
-        )
+        writer_loss.add_scalar("Average Wasserstein Distance", avg_wass_dist, epoch)
         writer_loss.add_scalar("Average loss Discriminator", C_avg_loss, epoch)
         writer_loss.add_scalar("Average loss Generator", G_avg_loss, epoch)
 
@@ -2093,14 +2040,16 @@ def _train_encoder_with_noise(
     device = get_device(device)
 
     # Transforms
-    transform = transform or T.Compose([
-        T.Resize(image_size),
-        T.ToTensor(),
-        T.Normalize(
-            [0.5 for _ in range(channels_img)],
-            [0.5 for _ in range(channels_img)],
-        ),
-    ])
+    transform = transform or T.Compose(
+        [
+            T.Resize(image_size),
+            T.ToTensor(),
+            T.Normalize(
+                [0.5 for _ in range(channels_img)],
+                [0.5 for _ in range(channels_img)],
+            ),
+        ]
+    )
 
     # Dataset and Dataloader
     dataset = get_dataset(file_path=file_path, transform=transform)
@@ -2186,15 +2135,9 @@ def _train_encoder_with_noise(
 
                     real_name, fake_name = "Real", "Generated by Encoder"
                     loss_E_name = "Loss Encoder"
-                    writer_real.add_image(
-                        real_name, img_grid_real, global_step=step
-                    )
-                    writer_fake.add_image(
-                        fake_name, img_grid_fake, global_step=step
-                    )
-                    writer_loss.add_scalar(
-                        loss_E_name, E_loss, global_step=step
-                    )
+                    writer_real.add_image(real_name, img_grid_real, global_step=step)
+                    writer_fake.add_image(fake_name, img_grid_fake, global_step=step)
+                    writer_loss.add_scalar(loss_E_name, E_loss, global_step=step)
 
                 step += 1
 
@@ -2228,14 +2171,16 @@ def train_encoder_with_wae(
     device = get_device(device)
 
     # Transforms
-    transform = transform or T.Compose([
-        T.Resize(image_size),
-        T.ToTensor(),
-        T.Normalize(
-            [0.5 for _ in range(channels_img)],
-            [0.5 for _ in range(channels_img)],
-        ),
-    ])
+    transform = transform or T.Compose(
+        [
+            T.Resize(image_size),
+            T.ToTensor(),
+            T.Normalize(
+                [0.5 for _ in range(channels_img)],
+                [0.5 for _ in range(channels_img)],
+            ),
+        ]
+    )
 
     # Dataset and Dataloader
     dataset, val_dataset = get_dataset(
@@ -2347,15 +2292,9 @@ def train_encoder_with_wae(
                     real_name, fake_name = "Real", "Generated by Encoder"
                     loss_E_name = "Loss Encoder"
                     wass_dist_name = "Wasserstein Distance"
-                    writer_real.add_image(
-                        real_name, img_grid_real, global_step=step
-                    )
-                    writer_fake.add_image(
-                        fake_name, img_grid_fake, global_step=step
-                    )
-                    writer_loss.add_scalar(
-                        loss_E_name, E_loss, global_step=step
-                    )
+                    writer_real.add_image(real_name, img_grid_real, global_step=step)
+                    writer_fake.add_image(fake_name, img_grid_fake, global_step=step)
+                    writer_loss.add_scalar(loss_E_name, E_loss, global_step=step)
                     writer_loss.add_scalar(
                         wass_dist_name, wasserstein_dist, global_step=step
                     )
@@ -2364,9 +2303,7 @@ def train_encoder_with_wae(
 
         avg_wass_dist = torch.mean(torch.FloatTensor(epoch_wass_dist)).item()
         E_avg_loss = torch.mean(torch.FloatTensor(E_losses)).item()
-        writer_loss.add_scalar(
-            "Average Wasserstein Distance", avg_wass_dist, epoch
-        )
+        writer_loss.add_scalar("Average Wasserstein Distance", avg_wass_dist, epoch)
         writer_loss.add_scalar("Average loss Encoder", E_avg_loss, epoch)
 
         # Save models
@@ -2394,14 +2331,16 @@ def finetune_encoder_with_samples(
     device = get_device(device)
 
     # Transforms
-    transform = transform or T.Compose([
-        T.Resize(image_size),
-        T.ToTensor(),
-        T.Normalize(
-            [0.5 for _ in range(channels_img)],
-            [0.5 for _ in range(channels_img)],
-        ),
-    ])
+    transform = transform or T.Compose(
+        [
+            T.Resize(image_size),
+            T.ToTensor(),
+            T.Normalize(
+                [0.5 for _ in range(channels_img)],
+                [0.5 for _ in range(channels_img)],
+            ),
+        ]
+    )
 
     # Dataset and Dataloader
     dataset = get_dataset(file_path=file_path, transform=transform)
@@ -2455,9 +2394,7 @@ def finetune_encoder_with_samples(
     E_avg_losses = []
 
     interpolate = lambda x: F.interpolate(x, scale_factor=4, mode="bilinear")
-    get_features = lambda x: alexnet.features(
-        alexnet_norm(interpolate(denorm(x)))
-    )
+    get_features = lambda x: alexnet.features(alexnet_norm(interpolate(denorm(x))))
     for epoch in range(num_epochs):
         E_losses = []
 
@@ -2502,15 +2439,9 @@ def finetune_encoder_with_samples(
 
                     real_name, fake_name = "Real", "Generated by Encoder"
                     loss_E_name = "Loss Encoder"
-                    writer_real.add_image(
-                        real_name, img_grid_real, global_step=step
-                    )
-                    writer_fake.add_image(
-                        fake_name, img_grid_fake, global_step=step
-                    )
-                    writer_loss.add_scalar(
-                        loss_E_name, E_loss, global_step=step
-                    )
+                    writer_real.add_image(real_name, img_grid_real, global_step=step)
+                    writer_fake.add_image(fake_name, img_grid_fake, global_step=step)
+                    writer_loss.add_scalar(loss_E_name, E_loss, global_step=step)
 
                 step += 1
 
@@ -2536,14 +2467,16 @@ def test_encoder(
     device = get_device(device)
 
     # Transforms
-    transform = transform or T.Compose([
-        T.Resize(image_size),
-        T.ToTensor(),
-        T.Normalize(
-            [0.5 for _ in range(channels_img)],
-            [0.5 for _ in range(channels_img)],
-        ),
-    ])
+    transform = transform or T.Compose(
+        [
+            T.Resize(image_size),
+            T.ToTensor(),
+            T.Normalize(
+                [0.5 for _ in range(channels_img)],
+                [0.5 for _ in range(channels_img)],
+            ),
+        ]
+    )
 
     # Dataset and Dataloader
     dataset = get_dataset(file_path=file_path, transform=transform)
@@ -2631,20 +2564,22 @@ if __name__ == "__main__":
     # FILE_PATH = (
     #     "/home/fmunoz/codeProjects/pythonProjects/wgan-gp/dataset/cleaned/data.npy"
     # )
-    TRANSFORM = T.Compose([
-        T.RandomHorizontalFlip(p=0.5),
-        T.RandomZoomOut(side_range=(1, 1.25), p=0.3),
-        T.Resize(IMAGE_SIZE),
-        T.RandomRotation(
-            degrees=(-10, 10), interpolation=T.InterpolationMode.BILINEAR
-        ),
-        T.ToTensor(),
-        T.ConvertImageDtype(torch.float32),
-        T.Normalize(
-            [0.5 for _ in range(CHANNELS_IMG)],
-            [0.5 for _ in range(CHANNELS_IMG)],
-        ),
-    ])
+    TRANSFORM = T.Compose(
+        [
+            T.RandomHorizontalFlip(p=0.5),
+            T.RandomZoomOut(side_range=(1, 1.25), p=0.3),
+            T.Resize(IMAGE_SIZE),
+            T.RandomRotation(
+                degrees=(-10, 10), interpolation=T.InterpolationMode.BILINEAR
+            ),
+            T.ToTensor(),
+            T.ConvertImageDtype(torch.float32),
+            T.Normalize(
+                [0.5 for _ in range(CHANNELS_IMG)],
+                [0.5 for _ in range(CHANNELS_IMG)],
+            ),
+        ]
+    )
     MILESTONES = [15, 30, 45, 60, 75, 90]
 
     LATENT_DIM = 128
@@ -2761,9 +2696,7 @@ if __name__ == "__main__":
     # data
     DATA_NAME = "data"
     DATA_PATH = Path("dataset") / "cleaned" / f"{DATA_NAME}.npy"
-    NAME_DIR = (
-        f"wae_{DATA_NAME}_zDim{LATENT_DIM}_{NOISE_NAME}_bs_{BATCH_SIZE}"
-    )
+    NAME_DIR = f"wae_{DATA_NAME}_zDim{LATENT_DIM}_{NOISE_NAME}_bs_{BATCH_SIZE}"
     SAVE_DIR = Path("networks") / NAME_DIR
     SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
     NUM_EPOCHS = 35
