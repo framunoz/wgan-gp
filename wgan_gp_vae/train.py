@@ -1140,7 +1140,10 @@ def train_wae_optimized(
             ),
         ]
     )
-    gaussian_blur = T.GaussianBlur(17, (0.1, 5))
+
+    sigma = 3
+    k_size = 2 * int(3 * sigma) + 1
+    gaussian_blur = T.GaussianBlur(k_size, (0.1, sigma))
 
     # Dataset and Dataloader
     dataset, val_dataset = get_dataset(
@@ -1205,7 +1208,6 @@ def train_wae_optimized(
 
     # for tensorboard plotting
     fixed_noise = noise_sampler(32)
-    # fixed_noise = G.sample_noise(32)
     summary_writer_dir = Path(summary_writer_dir)
     summary_writer_dir.mkdir(exist_ok=True, parents=True)
     writer_real = SummaryWriter(str(summary_writer_dir / "real"))
@@ -1243,7 +1245,6 @@ def train_wae_optimized(
         torch.cuda.empty_cache()
 
         epoch_wass_dist_WAE = []
-        G_epoch_losses = []
         E_epoch_losses = []
 
         if verbose:
@@ -1331,7 +1332,6 @@ def train_wae_optimized(
                         denoised_real_val[:32], normalize=True
                     )
 
-                    loss_G_name = "Loss Generator"
                     loss_E_name = "Loss Encoder"
                     wass_dist_name_WAE = "Wasserstein Distance WAE"
 
@@ -1409,15 +1409,11 @@ def train_wae_optimized(
 
         global_epoch = step - 1
         avg_wass_dist_WAE = torch.mean(torch.FloatTensor(epoch_wass_dist_WAE)).item()
-        G_avg_loss = torch.mean(torch.FloatTensor(G_epoch_losses)).item()
         E_avg_loss = torch.mean(torch.FloatTensor(E_epoch_losses)).item()
         writer_loss.add_scalars(
             wass_dist_name_WAE,
             {"Avg. " + wass_dist_name_WAE: avg_wass_dist_WAE},
             global_epoch,
-        )
-        writer_loss.add_scalars(
-            loss_G_name, {"Avg. " + loss_G_name: G_avg_loss}, global_epoch
         )
         writer_loss.add_scalars(
             loss_E_name, {"Avg. " + loss_E_name: E_avg_loss}, global_epoch
@@ -2557,8 +2553,9 @@ if __name__ == "__main__":
     IMAGE_SIZE = (size_x, size_y) = (32, 32)
     CRITERION: Literal["mse", "l1"] = "l1"
     CHANNELS_IMG = 1
-    BATCH_SIZE = 128
-    NUM_EPOCHS = 35
+    BATCH_SIZE = 64
+    NUM_EPOCHS = 100
+    PATIENCE = 10
     REPORT_EVERY = 10
     # FILE_PATH = "/home/fmunoz/codeProjects/pythonProjects/wgan-gp/dataset/quick_draw/face_recognized.npy"
     # FILE_PATH = (
@@ -2696,17 +2693,15 @@ if __name__ == "__main__":
     # data
     DATA_NAME = "data"
     DATA_PATH = Path("dataset") / "cleaned" / f"{DATA_NAME}.npy"
-    NAME_DIR = f"wae_{DATA_NAME}_zDim{LATENT_DIM}_{NOISE_NAME}_bs_{BATCH_SIZE}"
+    NAME_DIR = f"wae_{DATA_NAME}_zDim{LATENT_DIM}_{NOISE_NAME}"
     SAVE_DIR = Path("networks") / NAME_DIR
     SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
-    NUM_EPOCHS = 35
     train_wae_optimized(
         nn_kwargs=NN_KWARGS,
         latent_dim=LATENT_DIM,
         channels_img=CHANNELS_IMG,
         image_size=IMAGE_SIZE,
         learning_rate_E=3e-4,
-        # learning_rate_C=3e-4,
         learning_rate_G=3e-4,
         betas_wgan=(0.5, 0.9),
         betas_wae=(0.5, 0.9),
@@ -2720,9 +2715,7 @@ if __name__ == "__main__":
         report_every=REPORT_EVERY,
         milestones=MILESTONES,
         criterion=CRITERION,
-        # critic_iterations=5,
-        # crit_iter_patience=3,
-        patience=50,
+        patience=PATIENCE,
     )
 
     # LATENT_DIM = 64
