@@ -12,18 +12,14 @@ TypeModels = Literal["encoder", "generator"]
 
 
 @torch.jit.script
-def interpolate_images(
-    real: torch.Tensor, fake: torch.Tensor, alpha: torch.Tensor
-):
+def interpolate_images(real: torch.Tensor, fake: torch.Tensor, alpha: torch.Tensor):
     return real * alpha + fake * (1 - alpha)
 
 
 @torch.jit.script
 def compute_gradient_penalty_norm(gradient: torch.Tensor, penalty_gr: float):
     gradient_norm = gradient.norm(2, dim=1)
-    gradient_penalty = torch.mean(
-        F.leaky_relu(gradient_norm - 1, penalty_gr) ** 2
-    )
+    gradient_penalty = torch.mean(F.leaky_relu(gradient_norm - 1, penalty_gr) ** 2)
     return gradient_penalty, gradient_norm
 
 
@@ -77,9 +73,7 @@ def gradient_penalty(critic, real, fake, device="cpu", penalty_gr=10):
     )[0]
     gradient = gradient.view(gradient.shape[0], -1)
     gradient_norm = gradient.norm(2, dim=1)
-    gradient_penalty = torch.mean(
-        F.leaky_relu(gradient_norm - 1, penalty_gr) ** 2
-    )
+    gradient_penalty = torch.mean(F.leaky_relu(gradient_norm - 1, penalty_gr) ** 2)
     return gradient_penalty, gradient_norm
 
 
@@ -112,9 +106,7 @@ def alexnet_norm(x):
         x.max() <= 1 or x.min() >= 0
     ), f"Alexnet received input outside of range [0,1]: {x.min(),x.max()}"
     out = x - torch.tensor([0.485, 0.456, 0.406]).reshape(1, 3, 1, 1).type_as(x)
-    out = out / torch.tensor([0.229, 0.224, 0.225]).reshape(1, 3, 1, 1).type_as(
-        x
-    )
+    out = out / torch.tensor([0.229, 0.224, 0.225]).reshape(1, 3, 1, 1).type_as(x)
     return out
 
 
@@ -224,6 +216,71 @@ def rbf_kernel(
     return to_return
 
 
+def _approximation_error(matrix: torch.Tensor, s_matrix: torch.Tensor) -> torch.Tensor:
+    norm_of_matrix = torch.norm(matrix)
+    error = matrix - torch.mm(s_matrix, s_matrix)
+    error = torch.norm(error) / norm_of_matrix
+    return error
+
+
+def _sqrtm_newton_schulz(
+    matrix: torch.Tensor, num_iters: int = 100
+) -> tuple[torch.Tensor, torch.Tensor]:
+    r"""
+    Square root of matrix using Newton-Schulz Iterative method
+    Source: https://github.com/msubhransu/matrix-sqrt/blob/master/matrix_sqrt.py
+    Args:
+        matrix: matrix or batch of matrices
+        num_iters: Number of iteration of the method
+    Returns:
+        Square root of matrix
+        Error
+    """
+    expected_num_dims = 2
+    if matrix.dim() != expected_num_dims:
+        raise ValueError(
+            f"Input dimension equals {matrix.dim()}, expected {expected_num_dims}"
+        )
+
+    if num_iters <= 0:
+        raise ValueError(
+            f"Number of iteration equals {num_iters}, expected greater than 0"
+        )
+
+    dim = matrix.size(0)
+    device, dtype = matrix.device, matrix.dtype
+    norm_of_matrix = matrix.norm(p="fro")
+    Y = matrix.div(norm_of_matrix)
+    I = torch.eye(dim, dim, requires_grad=False, device=device, dtype=dtype)
+    Z = torch.eye(dim, dim, requires_grad=False, device=device, dtype=dtype)
+
+    s_matrix = torch.empty_like(matrix)
+    error = torch.empty(1, device=device, dtype=dtype)
+
+    for _ in range(num_iters):
+        T = 0.5 * (3.0 * I - Z.mm(Y))
+        Y = Y.mm(T)
+        Z = T.mm(Z)
+
+        s_matrix = Y * torch.sqrt(norm_of_matrix)
+        error = _approximation_error(matrix, s_matrix)
+        if torch.isclose(error, torch.zeros_like(error), atol=1e-5):
+            break
+
+    return s_matrix, error
+
+
+def bures_wass_dist(m, C):
+    n = m.shape[0]
+    C12, _ = _sqrtm_newton_schulz(C)
+    # B(s, t) = trace(Cs + Ct - 2 * sqrt(sqrt(Cs) * Ct * sqrt(Cs)))
+    # If Ct = Id then B(s, t) = trace(Cs) + n - 2 * trace(sqrt(Cs))
+    B = torch.trace(C) + n - 2 * torch.trace(C12)
+    dist = torch.norm(m) ** 2 + B**2
+    # return torch.sqrt(torch.maximum(dist, torch.zeros_like(dist))) / n
+    return dist / n**2
+
+
 class ProjectorOnManifold:
     def __init__(
         self,
@@ -239,27 +296,31 @@ class ProjectorOnManifold:
         self.img_size = image_size
         self._img_size_net = image_size_net
         channels_img = image_size_net[0]
-        self._transform_in = transform_in or transforms.Compose([
-            # From pdf to grayscale
-            transforms.Lambda(lambda x: x / torch.max(x)),
-            # transforms.Lambda(lambda x: x),
-            transforms.ToPILImage(),
-            transforms.Resize(image_size_net[1:]),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                [0.5 for _ in range(channels_img)],
-                [0.5 for _ in range(channels_img)],
-            ),
-        ])
-        self._transform_out = transform_out or transforms.Compose([
-            # Ensure the range is in [0, 1]
-            transforms.Lambda(lambda x: x - torch.min(x)),
-            transforms.Lambda(lambda x: x / torch.max(x)),
-            transforms.ToPILImage(),
-            transforms.Resize(image_size[1:]),
-            transforms.ToTensor(),
-            transforms.Lambda(lambda x: x / torch.sum(x)),
-        ])
+        self._transform_in = transform_in or transforms.Compose(
+            [
+                # From pdf to grayscale
+                transforms.Lambda(lambda x: x / torch.max(x)),
+                # transforms.Lambda(lambda x: x),
+                transforms.ToPILImage(),
+                transforms.Resize(image_size_net[1:]),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    [0.5 for _ in range(channels_img)],
+                    [0.5 for _ in range(channels_img)],
+                ),
+            ]
+        )
+        self._transform_out = transform_out or transforms.Compose(
+            [
+                # Ensure the range is in [0, 1]
+                transforms.Lambda(lambda x: x - torch.min(x)),
+                transforms.Lambda(lambda x: x / torch.max(x)),
+                transforms.ToPILImage(),
+                transforms.Resize(image_size[1:]),
+                transforms.ToTensor(),
+                transforms.Lambda(lambda x: x / torch.sum(x)),
+            ]
+        )
 
     @torch.no_grad()
     def forward(self, x):

@@ -28,7 +28,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import save_image
 from tqdm import tqdm
-from utils import alexnet_norm, denorm, gradient_penalty, imq_kernel
+from utils import alexnet_norm, bures_wass_dist, denorm, gradient_penalty, imq_kernel
 
 NUM_WORKERS = 10
 print(f"Using {NUM_WORKERS} workers.")
@@ -1110,7 +1110,7 @@ def train_wae_optimized(
     batch_size=128,
     image_size: int | tuple[int, int] = 64,
     num_epochs=100,
-    penalty_wae=10,
+    penalty_wae=1 / 5,
     criterion: Literal["mse", "l1"] = "l1",
     betas_wgan=(0.5, 0.9),
     betas_wae=(0.5, 0.999),
@@ -1246,6 +1246,7 @@ def train_wae_optimized(
 
         epoch_wass_dist_WAE = []
         E_epoch_losses = []
+        penalization_epoch = []
 
         if verbose:
             iterable = enumerate(
@@ -1276,10 +1277,13 @@ def train_wae_optimized(
 
             # According to the paper, this is the Wasserstein distance
             wasserstein_dist_WAE = criterion(real, x_recon)
-            mmd_loss = imq_kernel(
-                z, z_tilde, p_distr=G.latent_distr_name
-            )  # Compute MMD
-            E_loss = wasserstein_dist_WAE + penalty_wae * mmd_loss
+            z_tilde = z_tilde.squeeze()
+            m, C = torch.mean(z_tilde, dim=0), torch.cov(z_tilde.T)
+            penalization = bures_wass_dist(m, C)
+            # mmd_loss = imq_kernel(
+            #     z, z_tilde, p_distr=G.latent_distr_name
+            # )  # Compute MMD
+            E_loss = wasserstein_dist_WAE + penalty_wae * penalization
 
             # Update parameters of the encoder
             E_optimizer.zero_grad(set_to_none=True)
@@ -1292,8 +1296,8 @@ def train_wae_optimized(
             # Register occasionally
             if batch_idx % report_every == 0:
                 epoch_wass_dist_WAE.append(wasserstein_dist_WAE.data.item())
-
                 E_epoch_losses.append(E_loss.data.item())
+                penalization_epoch.append(penalization.data.item())
 
                 with torch.no_grad():
                     corrupted_real_val = gaussian_blur(real_val)
@@ -1332,17 +1336,14 @@ def train_wae_optimized(
                         denoised_real_val[:32], normalize=True
                     )
 
-                    loss_E_name = "Loss Encoder"
-                    wass_dist_name_WAE = "Wasserstein Distance WAE"
-
                     writer_real.add_image(
                         "1 Real", img_grid_real, global_step=step
                     )  # fmt: skip
-                    writer_real.add_image(
-                        "2 Real Blurred", img_grid_real_blur, global_step=step
-                    )
                     writer_fake.add_image(
-                        "3 Decoded", img_grid_fake_WAE, global_step=step
+                        "2 Decoded", img_grid_fake_WAE, global_step=step
+                    )
+                    writer_real.add_image(
+                        "3 Real Blurred", img_grid_real_blur, global_step=step
                     )
                     writer_fake.add_image(
                         "4 Denoise", img_grid_den_real, global_step=step
@@ -1350,11 +1351,11 @@ def train_wae_optimized(
                     writer_real.add_image(
                         "5 Real Val", img_grid_real_val, global_step=step
                     )
-                    writer_real.add_image(
-                        "6 Real Val Blurred", img_grid_real_val_blur, global_step=step
-                    )
                     writer_fake.add_image(
-                        "7 Decoded Val", img_grid_fake_val_WAE, global_step=step
+                        "6 Decoded Val", img_grid_fake_val_WAE, global_step=step
+                    )
+                    writer_real.add_image(
+                        "7 Real Val Blurred", img_grid_real_val_blur, global_step=step
                     )
                     writer_fake.add_image(
                         "8 Denoise Val", img_grid_den_real_val, global_step=step
@@ -1363,12 +1364,23 @@ def train_wae_optimized(
                         "9 Generated", img_grid_fake_WGAN, global_step=step
                     )
 
+                    loss_E_name = "Loss Encoder"
+                    wass_dist_name_WAE = "Wasserstein Distance WAE"
+                    penalization_name = "Penalization"
+
                     writer_loss.add_scalars(
-                        loss_E_name, {loss_E_name: E_loss}, global_step=step
+                        loss_E_name,
+                        {loss_E_name: E_loss},
+                        global_step=step,
                     )
                     writer_loss.add_scalars(
                         wass_dist_name_WAE,
                         {wass_dist_name_WAE: wasserstein_dist_WAE},
+                        global_step=step,
+                    )
+                    writer_loss.add_scalars(
+                        penalization_name,
+                        {penalization_name: penalization},
                         global_step=step,
                     )
 
@@ -1410,13 +1422,21 @@ def train_wae_optimized(
         global_epoch = step - 1
         avg_wass_dist_WAE = torch.mean(torch.FloatTensor(epoch_wass_dist_WAE)).item()
         E_avg_loss = torch.mean(torch.FloatTensor(E_epoch_losses)).item()
+        penalization_avg = torch.mean(torch.FloatTensor(penalization_epoch)).item()
         writer_loss.add_scalars(
             wass_dist_name_WAE,
             {"Avg. " + wass_dist_name_WAE: avg_wass_dist_WAE},
             global_epoch,
         )
         writer_loss.add_scalars(
-            loss_E_name, {"Avg. " + loss_E_name: E_avg_loss}, global_epoch
+            loss_E_name,
+            {"Avg. " + loss_E_name: E_avg_loss},
+            global_epoch,
+        )
+        writer_loss.add_scalars(
+            penalization_name,
+            {"Avg. " + penalization_name: penalization_avg},
+            global_epoch,
         )
         writer_loss.add_scalars(
             wass_dist_name_WAE,
@@ -2693,7 +2713,7 @@ if __name__ == "__main__":
     # data
     DATA_NAME = "data"
     DATA_PATH = Path("dataset") / "cleaned" / f"{DATA_NAME}.npy"
-    NAME_DIR = f"wae_{DATA_NAME}_zDim{LATENT_DIM}_{NOISE_NAME}"
+    NAME_DIR = f"dae_wwae_{DATA_NAME}_zDim{LATENT_DIM}_{NOISE_NAME}"
     SAVE_DIR = Path("networks") / NAME_DIR
     SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
     train_wae_optimized(
