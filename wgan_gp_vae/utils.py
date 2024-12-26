@@ -216,6 +216,7 @@ def rbf_kernel(
     return to_return
 
 
+@torch.jit.script
 def _approximation_error(matrix: torch.Tensor, s_matrix: torch.Tensor) -> torch.Tensor:
     norm_of_matrix = torch.norm(matrix)
     error = matrix - torch.mm(s_matrix, s_matrix)
@@ -223,6 +224,7 @@ def _approximation_error(matrix: torch.Tensor, s_matrix: torch.Tensor) -> torch.
     return error
 
 
+@torch.jit.script
 def _sqrtm_newton_schulz(
     matrix: torch.Tensor, num_iters: int = 100
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -249,10 +251,10 @@ def _sqrtm_newton_schulz(
 
     dim = matrix.size(0)
     device, dtype = matrix.device, matrix.dtype
-    norm_of_matrix = matrix.norm(p="fro")
+    norm_of_matrix = torch.norm(matrix)
     Y = matrix.div(norm_of_matrix)
-    I = torch.eye(dim, dim, requires_grad=False, device=device, dtype=dtype)
-    Z = torch.eye(dim, dim, requires_grad=False, device=device, dtype=dtype)
+    I = torch.eye(n=dim, device=device, dtype=dtype)
+    Z = torch.eye(n=dim, device=device, dtype=dtype)
 
     s_matrix = torch.empty_like(matrix)
     error = torch.empty(1, device=device, dtype=dtype)
