@@ -274,11 +274,11 @@ def _sqrtm_newton_schulz(
 
 def bures_wass_dist(m, C):
     n = m.shape[0]
-    C12, _ = _sqrtm_newton_schulz(C)
-    # B(s, t) = trace(Cs + Ct - 2 * sqrt(sqrt(Cs) * Ct * sqrt(Cs)))
-    # If Ct = Id then B(s, t) = trace(Cs) + n - 2 * trace(sqrt(Cs))
-    B = torch.trace(C) + n - 2 * torch.trace(C12)
-    dist = torch.norm(m) ** 2 + B**2
+    C12, _ = _sqrtm_newton_schulz(C, num_iters=5)
+    # B(s, t)^2 = trace(Cs + Ct - 2 * sqrt(sqrt(Cs) * Ct * sqrt(Cs)))
+    # If Ct = Id then B(s, t)^2 = trace(Cs) + n - 2 * trace(sqrt(Cs))
+    B2 = torch.trace(C) + n - 2 * torch.trace(C12)
+    dist = torch.norm(m) ** 2 + B2
     # return torch.sqrt(torch.maximum(dist, torch.zeros_like(dist))) / n
     return dist / n**2
 
