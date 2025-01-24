@@ -1471,7 +1471,7 @@ def train_wgan_and_dwae_optimized(
     crit_iter_patience=None,
     penalty_wgan_lp=10,
     penalty_wgan_gp=0.1,
-    penalty_wae=1,
+    penalty_wae=10,
     criterion: Literal["mse", "l1"] = "l1",
     betas_wgan=(0.5, 0.9),
     betas_wae=(0.5, 0.999),
@@ -3282,7 +3282,7 @@ if __name__ == "__main__":
     # data
     DATA_NAME = "data"
     DATA_PATH = Path("dataset") / "cleaned" / f"{DATA_NAME}.npy"
-    NAME_DIR = f"dwae_wgan_{DATA_NAME}_zDim{LATENT_DIM}_{NOISE_NAME}"
+    NAME_DIR = f"dwae_wgan_2_{DATA_NAME}_zDim{LATENT_DIM}_{NOISE_NAME}"
     SAVE_DIR = Path("networks") / NAME_DIR
     SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
     train_wgan_and_dwae_optimized(
