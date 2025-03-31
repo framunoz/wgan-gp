@@ -22,13 +22,15 @@ import torchvision.models as models
 import torchvision.transforms.functional as TF
 import torchvision.transforms.v2 as T
 import utils
-from model_resnet import Critic, Encoder, Generator, LatentDistribution, ResidualBlock
+from model_resnet import (Critic, Encoder, Generator, LatentDistribution,
+                          ResidualBlock)
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import save_image
 from tqdm import tqdm
-from utils import alexnet_norm, bures_wass_dist, denorm, gradient_penalty, imq_kernel
+from utils import (alexnet_norm, bures_wass_dist, denorm, gradient_penalty,
+                   imq_kernel)
 
 NUM_WORKERS = 10
 print(f"Using {NUM_WORKERS} workers.")
@@ -1128,6 +1130,8 @@ def train_dwae_optimized(
     summary_writer_dir: str | Path = "logs",
     verbose=True,
     report_every=100,
+    double_recon=False,
+    denoise=True,
 ):
     device = get_device(device)
 
@@ -1267,15 +1271,20 @@ def train_dwae_optimized(
         E_optimizer.zero_grad(set_to_none=True)
 
         for batch_idx, (real, _) in iterable:
-            real: torch.Tensor
             n: int = real.shape[0]
-            real: torch.Tensor = real.to(device, non_blocking=True)
+            real_ = real = real.to(device, non_blocking=True)
 
             # Train encoder: min |real - generator(encoder(real))| + penalization
             z = noise_sampler(n)
-            real_blur = gaussian_blur(real)
-            z_tilde = E(real_blur)  # Generate \tilde{z}_i from Q(Z|x_i) for i = 1:n
+            if denoise:
+                real_ = gaussian_blur(real)
+            z_tilde = E(real_)  # Generate \tilde{z}_i from Q(Z|x_i) for i = 1:n
             x_recon = G(z_tilde)
+            if double_recon:
+                z_recon = E(x_recon)  
+                x_recon_recon = G(z_recon)
+                
+
 
             # According to the paper, this is the Wasserstein distance
             wasserstein_dist_WAE = criterion(real, x_recon)
@@ -1285,7 +1294,16 @@ def train_dwae_optimized(
             # mmd_loss = imq_kernel(
             #     z, z_tilde, p_distr=G.latent_distr_name
             # )  # Compute MMD
-            E_loss = wasserstein_dist_WAE + penalty_wae * penalization
+            if double_recon:
+                recon_loss = criterion(real, x_recon_recon)
+                loss_weight = max(0.3, 1 - 0.07 * epoch)
+                E_loss = (
+                    loss_weight * wasserstein_dist_WAE
+                    + (1 - loss_weight) * recon_loss
+                    + penalty_wae * penalization
+                )
+            else:
+                E_loss = wasserstein_dist_WAE + penalty_wae * penalization
 
             # Update parameters of the encoder
             E_optimizer.zero_grad(set_to_none=True)
@@ -1305,7 +1323,7 @@ def train_dwae_optimized(
                     corrupted_real_val = gaussian_blur(real_val)
                     fake_WGAN = G(fixed_noise)
                     fake_WAE = G(E(real))
-                    denoised_real = G(E(real_blur))
+                    denoised_real = G(E(real_))
                     fake_val_WAE = G(E(real_val))
                     denoised_real_val = G(E(corrupted_real_val))
 
@@ -1313,8 +1331,8 @@ def train_dwae_optimized(
                     img_grid_real = torchvision.utils.make_grid(
                         real[:32], normalize=True
                     )
-                    img_grid_real_blur = torchvision.utils.make_grid(
-                        real_blur[:32], normalize=True
+                    img_grid_real_ = torchvision.utils.make_grid(
+                        real_[:32], normalize=True
                     )
                     img_grid_real_val = torchvision.utils.make_grid(
                         real_val[:32], normalize=True
@@ -1345,7 +1363,7 @@ def train_dwae_optimized(
                         "2 Decoded", img_grid_fake_WAE, global_step=step
                     )
                     writer_real.add_image(
-                        "3 Real Blurred", img_grid_real_blur, global_step=step
+                        "3 Real Blurred", img_grid_real_, global_step=step
                     )
                     writer_fake.add_image(
                         "4 Denoise", img_grid_den_real, global_step=step
@@ -1688,8 +1706,8 @@ def train_wgan_and_dwae_optimized(
 
             # Train encoder: min |real - generator(encoder(real))| + penalization
             z = noise_sampler(n)
-            real_blur = gaussian_blur(real)
-            z_tilde = E(real_blur)  # Generate \tilde{z}_i from Q(Z|x_i) for i = 1:n
+            real_ = gaussian_blur(real)
+            z_tilde = E(real_)  # Generate \tilde{z}_i from Q(Z|x_i) for i = 1:n
             x_recon = G(z_tilde)
 
             # According to the paper, this is the Wasserstein distance
@@ -1743,7 +1761,7 @@ def train_wgan_and_dwae_optimized(
                     corrupted_real_val = gaussian_blur(real_val)
                     fake_WGAN = G(fixed_noise)
                     fake_WAE = G(E(real))
-                    denoised_real = G(E(real_blur))
+                    denoised_real = G(E(real_))
                     fake_val_WAE = G(E(real_val))
                     denoised_real_val = G(E(corrupted_real_val))
 
@@ -1751,8 +1769,8 @@ def train_wgan_and_dwae_optimized(
                     img_grid_real = torchvision.utils.make_grid(
                         real[:32], normalize=True
                     )
-                    img_grid_real_blur = torchvision.utils.make_grid(
-                        real_blur[:32], normalize=True
+                    img_grid_real_ = torchvision.utils.make_grid(
+                        real_[:32], normalize=True
                     )
                     img_grid_real_val = torchvision.utils.make_grid(
                         real_val[:32], normalize=True
@@ -1792,7 +1810,7 @@ def train_wgan_and_dwae_optimized(
                         "2 Decoded", img_grid_fake_WAE, global_step=step
                     )
                     writer_real.add_image(
-                        "3 Real Blurred", img_grid_real_blur, global_step=step
+                        "3 Real Blurred", img_grid_real_, global_step=step
                     )
                     writer_fake.add_image(
                         "4 Denoise", img_grid_den_real, global_step=step
@@ -2023,6 +2041,8 @@ def train_wgan_and_dwae_double_recon_optimized(
     summary_writer_dir: str | Path = "logs",
     verbose=True,
     report_every=100,
+    denoising=True,
+    double_recon=True,
 ):
     device = get_device(device)
 
@@ -2194,7 +2214,7 @@ def train_wgan_and_dwae_double_recon_optimized(
 
         for batch_idx, (real, _) in iterable:
             n = real.shape[0]
-            real = real.to(device, non_blocking=True)
+            real_ = real = real.to(device, non_blocking=True)
 
             n_critic_iterations = critic_iterations(epoch)
             for _ in range(n_critic_iterations):
@@ -2224,32 +2244,35 @@ def train_wgan_and_dwae_double_recon_optimized(
 
             # Train encoder: min |real - generator(encoder(real))| + penalization
             z = noise_sampler(n)
-            real_blur = gaussian_blur(real)
-            z_tilde = E(real_blur)  # Generate \tilde{z}_i from Q(Z|x_i) for i = 1:n
+            if denoising:
+                real_ = gaussian_blur(real)
+
+            z_tilde = E(real_)  # Generate \tilde{z}_i from Q(Z|x_i) for i = 1:n
             x_recon = G(z_tilde)
 
             # Double reconstruction
-            z_recon = E(x_recon)
-            x_recon_recon = G(z_recon)
+            if double_recon:
+                z_recon = E(x_recon)
+                x_recon_recon = G(z_recon)
 
             # According to the paper, this is the Wasserstein distance
             wasserstein_dist_WAE = criterion(real, x_recon)
-            double_recon_loss = criterion(real, x_recon_recon)
 
             z_tilde = z_tilde.squeeze()
             m, cov = torch.mean(z_tilde, dim=0), torch.cov(z_tilde.T)
             penalization = bures_wass_dist(m, cov)
 
-            # The loss should be 1 at epoch 0 and 0.3 at epoch 10, then must be constant
-            loss_weight = max(0.3, 1 - 0.07 * epoch)
-            if epoch == 0:
-                E_loss = wasserstein_dist_WAE + penalty_wae * penalization
-            else:
+            if double_recon:
+                double_recon_loss = criterion(real, x_recon_recon)
+                # The loss should be 1 at epoch 0 and 0.3 at epoch 10, then must be constant
+                loss_weight = max(0.3, 1 - 0.07 * epoch)
                 E_loss = (
                     loss_weight * wasserstein_dist_WAE
                     + (1 - loss_weight) * double_recon_loss
                     + penalty_wae * penalization
                 )
+            else:
+                E_loss = wasserstein_dist_WAE + penalty_wae * penalization
 
             # Update parameters of the encoder
             E_optimizer.zero_grad(set_to_none=True)
@@ -2295,7 +2318,7 @@ def train_wgan_and_dwae_double_recon_optimized(
                     corrupted_real_val = gaussian_blur(real_val)
                     fake_WGAN = G(fixed_noise)
                     fake_WAE = G(E(real))
-                    denoised_real = G(E(real_blur))
+                    denoised_real = G(E(real_))
                     fake_val_WAE = G(E(real_val))
                     denoised_real_val = G(E(corrupted_real_val))
 
@@ -2303,8 +2326,8 @@ def train_wgan_and_dwae_double_recon_optimized(
                     img_grid_real = torchvision.utils.make_grid(
                         real[:32], normalize=True
                     )
-                    img_grid_real_blur = torchvision.utils.make_grid(
-                        real_blur[:32], normalize=True
+                    img_grid_real_ = torchvision.utils.make_grid(
+                        real_[:32], normalize=True
                     )
                     img_grid_real_val = torchvision.utils.make_grid(
                         real_val[:32], normalize=True
@@ -2344,7 +2367,7 @@ def train_wgan_and_dwae_double_recon_optimized(
                         "2 Decoded", img_grid_fake_WAE, global_step=step
                     )
                     writer_real.add_image(
-                        "3 Real Blurred", img_grid_real_blur, global_step=step
+                        "3 Real Blurred", img_grid_real_, global_step=step
                     )
                     writer_fake.add_image(
                         "4 Denoise", img_grid_den_real, global_step=step
@@ -3862,9 +3885,70 @@ if __name__ == "__main__":
 
     # MARK: DWAE-WGAN DOUBLE RECONSTRUCTION TRAINING
     # data
+    # DATA_NAME = "data"
+    # DATA_PATH = Path("dataset") / "cleaned" / f"{DATA_NAME}.npy"
+    # NAME_DIR = f"dwae_wgan_3_{DATA_NAME}_zDim{LATENT_DIM}_{NOISE_NAME}"
+    # SAVE_DIR = Path("networks") / NAME_DIR
+    # SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
+    # train_wgan_and_dwae_double_recon_optimized(
+    #     nn_kwargs=NN_KWARGS,
+    #     latent_dim=LATENT_DIM,
+    #     channels_img=CHANNELS_IMG,
+    #     image_size=IMAGE_SIZE,
+    #     learning_rate_E=3e-4,
+    #     learning_rate_C=3e-4,
+    #     learning_rate_G=3e-4,
+    #     betas_wgan=(0.5, 0.9),
+    #     betas_wae=(0.5, 0.9),
+    #     batch_size=BATCH_SIZE,
+    #     num_epochs=NUM_EPOCHS,
+    #     file_path=DATA_PATH,
+    #     ds_type=DS_TYPE,
+    #     save_dir=SAVE_DIR,
+    #     summary_writer_dir=SUMMARY_WRITER_DIR,
+    #     transform=TRANSFORM,
+    #     report_every=REPORT_EVERY,
+    #     milestones=MILESTONES,
+    #     criterion=CRITERION,
+    #     patience=PATIENCE,
+    # )
+
+    # MARK: DWAE DOUBLE RECONSTRUCTION TRAINING
+    # data
+    # DATA_NAME = "data"
+    # DATA_PATH = Path("dataset") / "cleaned" / f"{DATA_NAME}.npy"
+    # NAME_DIR = f"dae_wwae_double_recon_{DATA_NAME}_zDim{LATENT_DIM}_{NOISE_NAME}"
+    # SAVE_DIR = Path("networks") / NAME_DIR
+    # SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
+    # train_dwae_optimized(
+    #     nn_kwargs=NN_KWARGS,
+    #     latent_dim=LATENT_DIM,
+    #     channels_img=CHANNELS_IMG,
+    #     image_size=IMAGE_SIZE,
+    #     learning_rate_E=3e-4,
+    #     learning_rate_G=3e-4,
+    #     betas_wgan=(0.5, 0.9),
+    #     betas_wae=(0.5, 0.9),
+    #     batch_size=BATCH_SIZE,
+    #     num_epochs=NUM_EPOCHS,
+    #     file_path=DATA_PATH,
+    #     ds_type=DS_TYPE,
+    #     save_dir=SAVE_DIR,
+    #     summary_writer_dir=SUMMARY_WRITER_DIR,
+    #     transform=TRANSFORM,
+    #     report_every=REPORT_EVERY,
+    #     milestones=MILESTONES,
+    #     criterion=CRITERION,
+    #     patience=PATIENCE,
+    #     denoise=True,
+    #     double_recon=True,
+    # )
+
+    # MARK: WAE-WGAN DOUBLE RECONSTRUCTION TRAINING
+    # data
     DATA_NAME = "data"
     DATA_PATH = Path("dataset") / "cleaned" / f"{DATA_NAME}.npy"
-    NAME_DIR = f"dwae_wgan_3_{DATA_NAME}_zDim{LATENT_DIM}_{NOISE_NAME}"
+    NAME_DIR = f"dwae_wgan_5_{DATA_NAME}_zDim{LATENT_DIM}_{NOISE_NAME}"
     SAVE_DIR = Path("networks") / NAME_DIR
     SUMMARY_WRITER_DIR = Path("logs") / NAME_DIR
     train_wgan_and_dwae_double_recon_optimized(
@@ -3888,6 +3972,7 @@ if __name__ == "__main__":
         milestones=MILESTONES,
         criterion=CRITERION,
         patience=PATIENCE,
+        denoising=False,
     )
 
     # LATENT_DIM = 64
